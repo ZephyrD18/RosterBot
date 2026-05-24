@@ -663,9 +663,9 @@ def roster_embed(raid: dict) -> discord.Embed:
         else:
             dps_lines.append(line)
 
-    embed.add_field(name="Tanks", value="\n".join(tank_lines), inline=False)
-    embed.add_field(name="Healers", value="\n".join(healer_lines), inline=False)
-    embed.add_field(name="DPS", value="\n".join(dps_lines), inline=False)
+    embed.add_field(name="__**Tanks**__", value="\n".join(tank_lines), inline=False)
+    embed.add_field(name="__**Healers**__", value="\n".join(healer_lines), inline=False)
+    embed.add_field(name="__**DPS**__", value="\n".join(dps_lines), inline=False)
     embed.add_field(
         name="Open Slots",
         value=", ".join(missing) if missing else "Roster full.",
