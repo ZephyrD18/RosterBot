@@ -667,13 +667,15 @@ def roster_embed(raid: dict) -> discord.Embed:
     embed.add_field(name="__**DPS**__", value="\n".join(dps_lines), inline=False)
     open_slot_lines = []
     for _, role_keys, _ in ROSTER_GROUPS:
-        group_missing = [ROLE_LABELS[role_key] for role_key in role_keys if role_key not in raid["signups"]]
-        if group_missing:
-            open_slot_lines.append(", ".join(group_missing))
+        group_slots = []
+        for role_key in role_keys:
+            role_label = ROLE_LABELS[role_key]
+            group_slots.append(f"~~{role_label}~~" if role_key in raid["signups"] else role_label)
+        open_slot_lines.append(", ".join(group_slots))
 
     embed.add_field(
         name="__**Open Slots**__",
-        value="\n".join(open_slot_lines) if open_slot_lines else "Roster full.",
+        value="\n".join(open_slot_lines),
         inline=False,
     )
     standby_lines = [
