@@ -419,8 +419,7 @@ async def fetch_latest_signup_for_channel(channel_id: int):
     return await fetch_signup(row[0]) if row else None
 
 
-async def fetch_upcoming_raids():
-    now = int(datetime.now(timezone.utc).timestamp())
+async def fetch_scheduled_raids():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
@@ -429,9 +428,8 @@ async def fetch_upcoming_raids():
                    role_restrictions, group_name, reminders_sent, reminder_offset,
                    raid_role_id, raid_role_name
             FROM signups
-            WHERE scheduled_at IS NOT NULL AND scheduled_at > ?
+            WHERE scheduled_at IS NOT NULL
             """,
-            (now,),
         ) as cursor:
             return [raid_from_row(row) for row in await cursor.fetchall()]
 
@@ -1361,6 +1359,7 @@ async def clearroster(interaction: discord.Interaction, signup_message_id: str |
     raid["standby"] = {}
     raid["confirmations"] = []
     raid["locked"] = False
+    raid["reminders_sent"]["role_cleanup"] = True
     await save_raid_state(raid)
     await update_raid_messages(interaction.channel, raid)
     await interaction.followup.send(f"Cleared the roster for **{raid_title(raid)}**.", ephemeral=True)
@@ -1495,7 +1494,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "The bot sends one automatic reminder only. It chooses the longest available reminder window: "
             "24 hours, otherwise 12 hours, otherwise 8 hours, otherwise 6 hours before raid time. "
-            "The reminder pings the configured raid role. The bot must be running for the reminder to send."
+            "The reminder pings the configured raid role. Two hours after raid start, the bot removes "
+            "that role from signed players. The bot must be running for reminders and cleanup."
         ),
         inline=False,
     )
@@ -1513,11 +1513,26 @@ async def help_command(interaction: discord.Interaction):
 
 async def send_due_reminders():
     now = int(datetime.now(timezone.utc).timestamp())
-    raids = await fetch_upcoming_raids()
+    raids = await fetch_scheduled_raids()
 
     for raid in raids:
         scheduled_at = raid.get("scheduled_at")
         if not scheduled_at:
+            continue
+
+        channel = bot.get_channel(raid["channel_id"])
+
+        if now >= scheduled_at + (2 * 60 * 60) and not raid["reminders_sent"].get("role_cleanup"):
+            if channel is not None:
+                guild = getattr(channel, "guild", None)
+                for player in raid["signups"].values():
+                    await remove_raid_role_from_player(guild, raid, player)
+
+            raid["reminders_sent"]["role_cleanup"] = True
+            await save_raid_state(raid)
+            continue
+
+        if now > scheduled_at:
             continue
 
         reminder_offset = raid.get("reminder_offset")
@@ -1532,7 +1547,6 @@ async def send_due_reminders():
         if now < scheduled_at - reminder_offset or now > scheduled_at:
             continue
 
-        channel = bot.get_channel(raid["channel_id"])
         if channel is None:
             continue
 
@@ -1573,7 +1587,8 @@ async def on_ready():
                 """
                 SELECT signup_message_id, roster_message_id, channel_id, raid_name, date, time,
                        signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
-                       role_restrictions, group_name, reminders_sent, reminder_offset
+                       role_restrictions, group_name, reminders_sent, reminder_offset,
+                       raid_role_id, raid_role_name
                 FROM signups
                 """
             ) as cursor:
