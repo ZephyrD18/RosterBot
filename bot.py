@@ -1245,7 +1245,6 @@ class RaidSignupView(discord.ui.View):
     time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
     timezone="Timezone for the time you entered",
     group="Optional group or team name, such as Group A",
-    role_restrictions="Require Discord roles named Tank, Healer, or DPS to pick matching roles",
     raid_role="Optional role to assign to signed players and ping for reminders. Defaults to FFXIVActiveRoster.",
 )
 @app_commands.choices(timezone=TIMEZONE_CHOICES)
@@ -1256,11 +1255,10 @@ async def raidsignup(
     time: str,
     timezone: app_commands.Choice[str],
     group: str | None = None,
-    role_restrictions: bool = False,
     raid_role: discord.Role | None = None,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await create_raid(interaction, raid_name, date, time, timezone, group, role_restrictions, raid_role)
+    await create_raid(interaction, raid_name, date, time, timezone, group, False, raid_role)
 
 
 @tree.command(name="raidpreset", description="Create a raid signup from a preset raid name")
@@ -1270,7 +1268,6 @@ async def raidsignup(
     time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
     timezone="Timezone for the time you entered",
     group="Optional group or team name",
-    role_restrictions="Require Discord roles named Tank, Healer, or DPS",
     raid_role="Optional role to assign to signed players and ping for reminders. Defaults to FFXIVActiveRoster.",
 )
 @app_commands.choices(preset=PRESET_CHOICES, timezone=TIMEZONE_CHOICES)
@@ -1281,11 +1278,10 @@ async def raidpreset(
     time: str,
     timezone: app_commands.Choice[str],
     group: str | None = None,
-    role_restrictions: bool = False,
     raid_role: discord.Role | None = None,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await create_raid(interaction, preset.value, date, time, timezone, group, role_restrictions, raid_role)
+    await create_raid(interaction, preset.value, date, time, timezone, group, False, raid_role)
 
 
 @tree.command(name="lockroster", description="Lock a roster so players cannot change roles")
@@ -1565,7 +1561,7 @@ async def help_command(interaction: discord.Interaction):
             "`raid_name` is the raid name. `date` accepts `5/25`, `May 25`, or `2026-05-25`. `time` accepts `20:00`, "
             "`8:00 PM`, `8PM`, or `8 PM`. `timezone` is the timezone for the time you typed. "
             "`group` is optional for Group A/B style coordination. `raid_role` is optional and "
-            "defaults to a role named `FFXIVActiveRoster`. `role_restrictions` is optional."
+            "defaults to a role named `FFXIVActiveRoster`."
         ),
         inline=False,
     )
