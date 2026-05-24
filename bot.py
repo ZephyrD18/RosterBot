@@ -665,9 +665,15 @@ def roster_embed(raid: dict) -> discord.Embed:
     embed.add_field(name="__**Tanks**__", value="\n".join(tank_lines), inline=False)
     embed.add_field(name="__**Healers**__", value="\n".join(healer_lines), inline=False)
     embed.add_field(name="__**DPS**__", value="\n".join(dps_lines), inline=False)
+    open_slot_lines = []
+    for _, role_keys, _ in ROSTER_GROUPS:
+        group_missing = [ROLE_LABELS[role_key] for role_key in role_keys if role_key not in raid["signups"]]
+        if group_missing:
+            open_slot_lines.append(", ".join(group_missing))
+
     embed.add_field(
         name="__**Open Slots**__",
-        value=", ".join(missing) if missing else "Roster full.",
+        value="\n".join(open_slot_lines) if open_slot_lines else "Roster full.",
         inline=False,
     )
     standby_lines = [
@@ -1452,9 +1458,37 @@ async def raidrole(
     await interaction.followup.send(message, ephemeral=True)
 
 
-@tree.command(name="clearroster", description="Clear a raid roster, remove raid roles, and delete bot posts")
+@tree.command(name="clearroster", description="Clear a raid roster and remove assigned raid roles")
 @app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
 async def clearroster(interaction: discord.Interaction, signup_message_id: str | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    allowed, error = require_roster_manager(interaction)
+    if not allowed:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    raid, error = await resolve_raid_for_command(interaction, signup_message_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    for player in raid["signups"].values():
+        await remove_raid_role_from_player(interaction.guild, raid, player)
+
+    raid["signups"] = {}
+    raid["waitlist"] = {}
+    raid["standby"] = {}
+    raid["confirmations"] = []
+    raid["locked"] = False
+    raid["reminders_sent"]["role_cleanup"] = True
+    await save_raid_state(raid)
+    await update_raid_messages(interaction.channel, raid)
+    await interaction.followup.send(f"Cleared **{raid_title(raid)}**.", ephemeral=True)
+
+
+@tree.command(name="deleteroster", description="Clear a roster, remove raid roles, and delete bot posts")
+@app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
+async def deleteroster(interaction: discord.Interaction, signup_message_id: str | None = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
     allowed, error = require_roster_manager(interaction)
     if not allowed:
@@ -1479,7 +1513,7 @@ async def clearroster(interaction: discord.Interaction, signup_message_id: str |
             pass
 
     await delete_raid_row(raid["signup_message_id"])
-    await interaction.followup.send(f"Cleared and deleted **{raid_title(raid)}**.", ephemeral=True)
+    await interaction.followup.send(f"Deleted roster for **{raid_title(raid)}**.", ephemeral=True)
 
 
 @tree.command(name="deleteraid", description="Delete a raid signup, roster post, and database entry")
@@ -1567,10 +1601,11 @@ async def help_command(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="/clearroster and /deleteraid",
+        name="/clearroster, /deleteroster, and /deleteraid",
         value=(
-            "`/clearroster` removes assigned raid roles, deletes the signup and roster posts, and removes the saved roster. "
-            "`/deleteraid` removes both bot posts and deletes the saved roster. Requires Manage Messages."
+            "`/clearroster` removes assigned raid roles and resets the roster while keeping the bot posts. "
+            "`/deleteroster` removes assigned raid roles, deletes the signup and roster posts, and removes the saved roster. "
+            "`/deleteraid` also deletes both bot posts and the saved roster. Requires Manage Messages."
         ),
         inline=False,
     )
