@@ -639,7 +639,6 @@ def roster_embed(raid: dict) -> discord.Embed:
     missing = missing_role_labels(raid["signups"])
     summary = (
         f"{schedule_text(raid)}\n"
-        f"**Signed:** {len(raid['signups'])}/8\n"
         f"**Standby:** {len(raid['standby'])}\n"
         f"**Open:** {len(missing)}"
     )
