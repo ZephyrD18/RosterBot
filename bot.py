@@ -881,7 +881,10 @@ def standby_panel_text(raid: dict, user_id: int) -> str:
     entry = raid["standby"].get(str(user_id))
     roles = entry["roles"] if entry else []
     selected = standby_role_text(roles) if roles else "None"
-    return f"Standby roles for **{raid_title(raid)}**: **{selected}**\nToggle any roles you can cover."
+    return (
+        f"Standby roles for **{raid_title(raid)}**: **{selected}**\n"
+        "Toggle any roles you can cover, then press **Confirm Standby**."
+    )
 
 
 class StandbyRoleView(discord.ui.View):
@@ -890,6 +893,7 @@ class StandbyRoleView(discord.ui.View):
         self.signup_message_id = signup_message_id
         self.user_id = user_id
         self.add_role_buttons()
+        self.add_confirm_button()
         self.add_clear_button()
 
     def add_role_buttons(self):
@@ -902,6 +906,17 @@ class StandbyRoleView(discord.ui.View):
             )
             button.callback = self.create_toggle_callback(role_name)
             self.add_item(button)
+
+    def add_confirm_button(self):
+        button = discord.ui.Button(
+            label="Confirm Standby",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"standby:{self.signup_message_id}:{self.user_id}:confirm",
+            row=1,
+        )
+        button.callback = self.confirm_callback
+        self.add_item(button)
 
     def add_clear_button(self):
         button = discord.ui.Button(
@@ -957,6 +972,27 @@ class StandbyRoleView(discord.ui.View):
         await save_raid_state(raid)
         await update_raid_messages(interaction.channel, raid)
         await interaction.edit_original_response(content=standby_panel_text(raid, interaction.user.id), view=self)
+
+    async def confirm_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This standby picker is not yours.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        raid = await fetch_signup(self.signup_message_id)
+        if not raid:
+            await interaction.followup.send("I could not find this raid signup anymore.", ephemeral=True)
+            return
+
+        entry = raid["standby"].get(str(interaction.user.id))
+        if not entry:
+            await interaction.followup.send("Pick at least one standby role before confirming.", ephemeral=True)
+            return
+
+        await interaction.edit_original_response(
+            content=f"Standby roles confirmed: **{standby_role_text(entry['roles'])}**.",
+            view=None,
+        )
         await interaction.followup.send(
             "Do you still need the mount?",
             view=MountNeedView(self.signup_message_id, interaction.user.id),
@@ -1482,8 +1518,8 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="Standby List",
         value=(
-            "Click `Standby`, then toggle every role type you can cover. The roster shows entries like "
-            "`@User - Tank`, `@User - DPS/Healer`, or `@User - Any` when all three are selected."
+            "Click `Standby`, toggle every role type you can cover, then press `Confirm Standby`. "
+            "The roster shows entries like `@User - Tank`, `@User - DPS/Healer`, or `@User - Any`."
         ),
         inline=False,
     )
