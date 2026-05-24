@@ -667,7 +667,7 @@ def roster_embed(raid: dict) -> discord.Embed:
     embed.add_field(name="__**Healers**__", value="\n".join(healer_lines), inline=False)
     embed.add_field(name="__**DPS**__", value="\n".join(dps_lines), inline=False)
     embed.add_field(
-        name="Open Slots",
+        name="__**Open Slots**__",
         value=", ".join(missing) if missing else "Roster full.",
         inline=False,
     )
@@ -676,11 +676,11 @@ def roster_embed(raid: dict) -> discord.Embed:
         for entry in raid["standby"].values()
     ]
     embed.add_field(
-        name="Standby",
+        name="__**Standby**__",
         value="\n".join(standby_lines) if standby_lines else "No standby players.",
         inline=False,
     )
-    embed.add_field(name="Mounts Needed", value=str(mount_needed_count(raid)), inline=False)
+    embed.add_field(name="__**Mounts Needed**__", value=str(mount_needed_count(raid)), inline=False)
     return embed
 
 
