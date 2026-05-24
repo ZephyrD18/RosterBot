@@ -210,6 +210,12 @@ def standby_role_text(roles: list[str]) -> str:
     return "/".join(role for role in STANDBY_CHOICES if role in roles)
 
 
+def mount_needed_count(raid: dict) -> int:
+    main_count = sum(1 for player in raid["signups"].values() if player.get("needs_mount") is True)
+    standby_count = sum(1 for player in raid["standby"].values() if player.get("needs_mount") is True)
+    return main_count + standby_count
+
+
 def missing_role_labels(signups: dict) -> list[str]:
     return [label for role_key, label, _, _, _ in ROLES if role_key not in signups]
 
@@ -496,11 +502,47 @@ def timezone_for_local_datetime(timezone_name: str, local_datetime: datetime):
     return timezone(timedelta(hours=offset_hours), name=timezone_name)
 
 
+def parse_raid_date(date_text: str):
+    clean_date = " ".join(date_text.strip().replace("-", "/").split())
+    current_year = datetime.now().year
+
+    date_formats_with_year = (
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+    )
+    for date_format in date_formats_with_year:
+        try:
+            return datetime.strptime(clean_date, date_format).date()
+        except ValueError:
+            pass
+
+    date_formats_without_year = (
+        "%m/%d",
+        "%B %d",
+        "%b %d",
+        "%B %d,",
+        "%b %d,",
+    )
+    for date_format in date_formats_without_year:
+        try:
+            parsed = datetime.strptime(clean_date, date_format).date()
+            parsed = parsed.replace(year=current_year)
+            if parsed < datetime.now().date():
+                parsed = parsed.replace(year=current_year + 1)
+            return parsed
+        except ValueError:
+            pass
+
+    raise ValueError("Use a date like `5/25`, `May 25`, or `2026-05-25`.")
+
+
 def parse_raid_datetime(date_text: str, time_text: str, timezone_name: str) -> int:
-    try:
-        parsed_date = datetime.strptime(date_text.strip(), "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise ValueError("Use the date format `YYYY-MM-DD`, like `2026-05-25`.") from exc
+    parsed_date = parse_raid_date(date_text)
 
     time_formats = ("%H:%M", "%I:%M %p", "%I %p")
     parsed_time = None
@@ -610,6 +652,7 @@ def roster_embed(raid: dict) -> discord.Embed:
         value="\n".join(standby_lines) if standby_lines else "No standby players.",
         inline=False,
     )
+    embed.add_field(name="Mounts Needed", value=str(mount_needed_count(raid)), inline=False)
     return embed
 
 
@@ -624,6 +667,7 @@ def roster_export_text(raid: dict) -> str:
         lines.append("Standby:")
         for entry in raid["standby"].values():
             lines.append(f"{player_text(entry)} - {standby_role_text(entry['roles'])} - {mount_text(entry)}")
+    lines.append(f"Mounts Needed: {mount_needed_count(raid)}")
     return "\n".join(line for line in lines if line)
 
 
@@ -1118,7 +1162,7 @@ class RaidSignupView(discord.ui.View):
 @tree.command(name="raidsignup", description="Create a custom raid signup")
 @app_commands.describe(
     raid_name="Name of the raid",
-    date="Raid date in YYYY-MM-DD format, such as 2026-05-25",
+    date="Raid date, such as 5/25, May 25, or 2026-05-25",
     time="Raid time, such as 20:00, 8:00 PM, or 8 PM",
     timezone="Timezone for the time you entered",
     group="Optional group or team name, such as Group A",
@@ -1143,7 +1187,7 @@ async def raidsignup(
 @tree.command(name="raidpreset", description="Create a raid signup from a preset raid name")
 @app_commands.describe(
     preset="Preset raid",
-    date="Raid date in YYYY-MM-DD format",
+    date="Raid date, such as 5/25, May 25, or 2026-05-25",
     time="Raid time, such as 20:00, 8:00 PM, or 8 PM",
     timezone="Timezone for the time you entered",
     group="Optional group or team name",
@@ -1409,7 +1453,7 @@ async def help_command(interaction: discord.Interaction):
         name="/raidsignup",
         value=(
             "Creates a custom raid signup and a live roster post.\n"
-            "`raid_name` is the raid name. `date` uses `YYYY-MM-DD`. `time` accepts `20:00`, "
+            "`raid_name` is the raid name. `date` accepts `5/25`, `May 25`, or `2026-05-25`. `time` accepts `20:00`, "
             "`8:00 PM`, or `8 PM`. `timezone` is the timezone for the time you typed. "
             "`group` is optional for Group A/B style coordination. `raid_role` is optional and "
             "defaults to a role named `FFXIVActiveRoster`. `role_restrictions` is optional."
