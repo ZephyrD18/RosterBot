@@ -544,17 +544,23 @@ def parse_raid_date(date_text: str):
 def parse_raid_datetime(date_text: str, time_text: str, timezone_name: str) -> int:
     parsed_date = parse_raid_date(date_text)
 
+    clean_time = " ".join(time_text.strip().upper().replace(".", "").split())
+    if clean_time.endswith("AM") or clean_time.endswith("PM"):
+        suffix = clean_time[-2:]
+        prefix = clean_time[:-2].strip()
+        clean_time = f"{prefix} {suffix}"
+
     time_formats = ("%H:%M", "%I:%M %p", "%I %p")
     parsed_time = None
     for time_format in time_formats:
         try:
-            parsed_time = datetime.strptime(time_text.strip().upper(), time_format).time()
+            parsed_time = datetime.strptime(clean_time, time_format).time()
             break
         except ValueError:
             pass
 
     if parsed_time is None:
-        raise ValueError("Use a time like `20:00`, `8:00 PM`, or `8 PM`.") from None
+        raise ValueError("Use a time like `20:00`, `8:00 PM`, `8PM`, or `8 PM`.") from None
 
     local_datetime = datetime.combine(parsed_date, parsed_time)
     selected_timezone = timezone_for_local_datetime(timezone_name, local_datetime)
@@ -1207,7 +1213,7 @@ class RaidSignupView(discord.ui.View):
 @app_commands.describe(
     raid_name="Name of the raid",
     date="Raid date, such as 5/25, May 25, or 2026-05-25",
-    time="Raid time, such as 20:00, 8:00 PM, or 8 PM",
+    time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
     timezone="Timezone for the time you entered",
     group="Optional group or team name, such as Group A",
     role_restrictions="Require Discord roles named Tank, Healer, or DPS to pick matching roles",
@@ -1232,7 +1238,7 @@ async def raidsignup(
 @app_commands.describe(
     preset="Preset raid",
     date="Raid date, such as 5/25, May 25, or 2026-05-25",
-    time="Raid time, such as 20:00, 8:00 PM, or 8 PM",
+    time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
     timezone="Timezone for the time you entered",
     group="Optional group or team name",
     role_restrictions="Require Discord roles named Tank, Healer, or DPS",
@@ -1500,7 +1506,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "Creates a custom raid signup and a live roster post.\n"
             "`raid_name` is the raid name. `date` accepts `5/25`, `May 25`, or `2026-05-25`. `time` accepts `20:00`, "
-            "`8:00 PM`, or `8 PM`. `timezone` is the timezone for the time you typed. "
+            "`8:00 PM`, `8PM`, or `8 PM`. `timezone` is the timezone for the time you typed. "
             "`group` is optional for Group A/B style coordination. `raid_role` is optional and "
             "defaults to a role named `FFXIVActiveRoster`. `role_restrictions` is optional."
         ),
