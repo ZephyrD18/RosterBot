@@ -993,11 +993,12 @@ class StandbyRoleView(discord.ui.View):
             content=f"Standby roles confirmed: **{standby_role_text(entry['roles'])}**.",
             view=None,
         )
-        await interaction.followup.send(
-            "Do you still need the mount?",
-            view=MountNeedView(self.signup_message_id, interaction.user.id),
-            ephemeral=True,
-        )
+        if entry.get("needs_mount") is None:
+            await interaction.followup.send(
+                "Do you still need the mount?",
+                view=MountNeedView(self.signup_message_id, interaction.user.id),
+                ephemeral=True,
+            )
 
     async def clear_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -1100,14 +1101,20 @@ class RaidSignupView(discord.ui.View):
 
         user_id = interaction.user.id
         previous_role_key = None
+        needs_mount = None
         for existing_role_key, player in list(raid["signups"].items()):
             if player.get("user_id") == user_id:
                 previous_role_key = existing_role_key
+                needs_mount = player.get("needs_mount")
                 del raid["signups"][existing_role_key]
                 break
 
+        standby_entry = raid["standby"].get(str(user_id))
+        if needs_mount is None and standby_entry:
+            needs_mount = standby_entry.get("needs_mount")
+
         remove_user_from_standby(raid["standby"], user_id)
-        raid["signups"][role_key] = player_from_user(interaction.user)
+        raid["signups"][role_key] = player_from_user(interaction.user) | {"needs_mount": needs_mount}
         role_warning = None
         if isinstance(interaction.user, discord.Member):
             role_warning = await add_raid_role(interaction.user, raid)
@@ -1125,11 +1132,12 @@ class RaidSignupView(discord.ui.View):
             message += f"\n{role_warning}"
 
         await interaction.followup.send(message, ephemeral=True)
-        await interaction.followup.send(
-            "Do you still need the mount?",
-            view=MountNeedView(self.signup_message_id, interaction.user.id),
-            ephemeral=True,
-        )
+        if needs_mount is None:
+            await interaction.followup.send(
+                "Do you still need the mount?",
+                view=MountNeedView(self.signup_message_id, interaction.user.id),
+                ephemeral=True,
+            )
 
     async def standby_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
