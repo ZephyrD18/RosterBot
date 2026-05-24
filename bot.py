@@ -76,6 +76,12 @@ ROLES = [
 
 ROLE_LABELS = {key: label for key, label, _, _, _ in ROLES}
 ROLE_CATEGORIES = {key: category for key, _, _, _, category in ROLES}
+ROSTER_GROUPS = [
+    ("Tanks", ("MT", "OT"), 2),
+    ("Healers", ("H1", "H2"), 2),
+    ("Melee DPS", ("M1", "M2"), 2),
+    ("Ranged DPS", ("R1", "R2"), 2),
+]
 REMINDER_WINDOWS = [
     (24 * 60 * 60, "24 hours"),
     (12 * 60 * 60, "12 hours"),
@@ -619,33 +625,35 @@ def signup_embed(raid: dict) -> discord.Embed:
     return embed
 
 
+def roster_group_field(raid: dict, title: str, role_keys: tuple[str, ...], limit: int):
+    filled = sum(1 for role_key in role_keys if role_key in raid["signups"])
+    lines = []
+    for index, role_key in enumerate(role_keys, start=1):
+        player = raid["signups"].get(role_key)
+        lines.append(f"`{index}` **{ROLE_LABELS[role_key]}:** {roster_player_text(player)}")
+
+    return f"{title} {filled}/{limit}", "\n".join(lines)
+
+
 def roster_embed(raid: dict) -> discord.Embed:
+    missing = missing_role_labels(raid["signups"])
+    summary = (
+        f"{schedule_text(raid)}\n"
+        f"**Signed:** {len(raid['signups'])}/8\n"
+        f"**Standby:** {len(raid['standby'])}\n"
+        f"**Open:** {len(missing)}"
+    )
     embed = discord.Embed(
         title=f"📜 {raid_title(raid)} Roster",
-        description=schedule_text(raid),
+        description=summary,
         color=0xD4AF37,
     )
 
-    tank_lines = []
-    healer_lines = []
-    dps_lines = []
-    for role_key, role_label, role_emoji, _, _ in ROLES:
-        player = raid["signups"].get(role_key)
-        line = f"{role_emoji} **{role_label}:** {roster_player_text(player)}"
-
-        if role_key in {"MT", "OT"}:
-            tank_lines.append(line)
-        elif role_key in {"H1", "H2"}:
-            healer_lines.append(line)
-        else:
-            dps_lines.append(line)
-
-    missing = missing_role_labels(raid["signups"])
-    embed.add_field(name="Tanks", value="\n".join(tank_lines), inline=False)
-    embed.add_field(name="Healers", value="\n".join(healer_lines), inline=False)
-    embed.add_field(name="DPS", value="\n".join(dps_lines), inline=False)
+    for title, role_keys, limit in ROSTER_GROUPS:
+        name, value = roster_group_field(raid, title, role_keys, limit)
+        embed.add_field(name=name, value=value, inline=True)
     embed.add_field(
-        name="Missing",
+        name="Open Slots",
         value=", ".join(missing) if missing else "Roster full.",
         inline=False,
     )
