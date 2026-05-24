@@ -1381,7 +1381,7 @@ async def raidrole(
     await interaction.followup.send(message, ephemeral=True)
 
 
-@tree.command(name="clearroster", description="Clear a raid roster and reopen every role")
+@tree.command(name="clearroster", description="Clear a raid roster, remove raid roles, and delete bot posts")
 @app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
 async def clearroster(interaction: discord.Interaction, signup_message_id: str | None = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1398,15 +1398,17 @@ async def clearroster(interaction: discord.Interaction, signup_message_id: str |
     for player in raid["signups"].values():
         await remove_raid_role_from_player(interaction.guild, raid, player)
 
-    raid["signups"] = {}
-    raid["waitlist"] = {}
-    raid["standby"] = {}
-    raid["confirmations"] = []
-    raid["locked"] = False
-    raid["reminders_sent"]["role_cleanup"] = True
-    await save_raid_state(raid)
-    await update_raid_messages(interaction.channel, raid)
-    await interaction.followup.send(f"Cleared the roster for **{raid_title(raid)}**.", ephemeral=True)
+    for message_id in (raid["signup_message_id"], raid.get("roster_message_id")):
+        if not message_id:
+            continue
+        try:
+            message = await interaction.channel.fetch_message(message_id)
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound):
+            pass
+
+    await delete_raid_row(raid["signup_message_id"])
+    await interaction.followup.send(f"Cleared and deleted **{raid_title(raid)}**.", ephemeral=True)
 
 
 @tree.command(name="deleteraid", description="Delete a raid signup, roster post, and database entry")
@@ -1496,7 +1498,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="/clearroster and /deleteraid",
         value=(
-            "`/clearroster` wipes signups, standby entries, and unlocks the roster. "
+            "`/clearroster` removes assigned raid roles, deletes the signup and roster posts, and removes the saved roster. "
             "`/deleteraid` removes both bot posts and deletes the saved roster. Requires Manage Messages."
         ),
         inline=False,
