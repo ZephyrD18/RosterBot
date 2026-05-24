@@ -649,9 +649,23 @@ def roster_embed(raid: dict) -> discord.Embed:
         color=0xD4AF37,
     )
 
-    for title, role_keys, limit in ROSTER_GROUPS:
-        name, value = roster_group_field(raid, title, role_keys, limit)
-        embed.add_field(name=name, value=value, inline=True)
+    tank_lines = []
+    healer_lines = []
+    dps_lines = []
+    for role_key, role_label, role_emoji, _, _ in ROLES:
+        player = raid["signups"].get(role_key)
+        line = f"{role_emoji} **{role_label}:** {roster_player_text(player)}"
+
+        if role_key in {"MT", "OT"}:
+            tank_lines.append(line)
+        elif role_key in {"H1", "H2"}:
+            healer_lines.append(line)
+        else:
+            dps_lines.append(line)
+
+    embed.add_field(name="Tanks", value="\n".join(tank_lines), inline=False)
+    embed.add_field(name="Healers", value="\n".join(healer_lines), inline=False)
+    embed.add_field(name="DPS", value="\n".join(dps_lines), inline=False)
     embed.add_field(
         name="Open Slots",
         value=", ".join(missing) if missing else "Roster full.",
