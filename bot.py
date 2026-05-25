@@ -17,6 +17,7 @@ DB_PATH = "raids.db"
 views_loaded = False
 reminder_task = None
 DEFAULT_RAID_ROLE_NAME = "FFXIVActiveRoster"
+DEFAULT_NOTIFY_ROLE_NAME = "FFXIV Raid"
 DEFAULT_TIMEZONE_NAME = "ET"
 
 ROLE_CHOICES = [
@@ -328,7 +329,11 @@ async def init_db():
                 reminders_sent TEXT NOT NULL DEFAULT '{}',
                 reminder_offset INTEGER,
                 raid_role_id INTEGER,
-                raid_role_name TEXT
+                raid_role_name TEXT,
+                announcement_message_id INTEGER,
+                setup_message TEXT,
+                notify_role_id INTEGER,
+                notify_role_name TEXT
             )
             """
         )
@@ -356,6 +361,10 @@ async def init_db():
             ("reminder_offset", "INTEGER"),
             ("raid_role_id", "INTEGER"),
             ("raid_role_name", "TEXT"),
+            ("announcement_message_id", "INTEGER"),
+            ("setup_message", "TEXT"),
+            ("notify_role_id", "INTEGER"),
+            ("notify_role_name", "TEXT"),
         )
         for column_name, column_type in migrations:
             if column_name not in columns:
@@ -388,6 +397,10 @@ def raid_from_row(row) -> dict | None:
         "reminder_offset": row[16],
         "raid_role_id": row[17],
         "raid_role_name": row[18],
+        "announcement_message_id": row[19],
+        "setup_message": row[20],
+        "notify_role_id": row[21],
+        "notify_role_name": row[22],
     }
 
 
@@ -398,7 +411,8 @@ async def fetch_signup(signup_message_id: int):
             SELECT signup_message_id, roster_message_id, channel_id, raid_name, date, time,
                    signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                    role_restrictions, group_name, reminders_sent, reminder_offset,
-                   raid_role_id, raid_role_name
+                   raid_role_id, raid_role_name, announcement_message_id, setup_message,
+                   notify_role_id, notify_role_name
             FROM signups
             WHERE signup_message_id = ?
             """,
@@ -431,7 +445,8 @@ async def fetch_scheduled_raids():
             SELECT signup_message_id, roster_message_id, channel_id, raid_name, date, time,
                    signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                    role_restrictions, group_name, reminders_sent, reminder_offset,
-                   raid_role_id, raid_role_name
+                   raid_role_id, raid_role_name, announcement_message_id, setup_message,
+                   notify_role_id, notify_role_name
             FROM signups
             WHERE scheduled_at IS NOT NULL
             """,
@@ -446,7 +461,8 @@ async def save_raid_state(raid: dict):
             UPDATE signups
             SET signups = ?, waitlist = ?, standby = ?, confirmations = ?, locked = ?,
                 role_restrictions = ?, group_name = ?, reminders_sent = ?, reminder_offset = ?,
-                raid_role_id = ?, raid_role_name = ?
+                raid_role_id = ?, raid_role_name = ?, announcement_message_id = ?,
+                setup_message = ?, notify_role_id = ?, notify_role_name = ?
             WHERE signup_message_id = ?
             """,
             (
@@ -461,6 +477,10 @@ async def save_raid_state(raid: dict):
                 raid.get("reminder_offset"),
                 raid.get("raid_role_id"),
                 raid.get("raid_role_name"),
+                raid.get("announcement_message_id"),
+                raid.get("setup_message"),
+                raid.get("notify_role_id"),
+                raid.get("notify_role_name"),
                 raid["signup_message_id"],
             ),
         )
@@ -594,6 +614,21 @@ def raid_title(raid: dict) -> str:
     return f"{raid['raid_name']}{group}"
 
 
+def default_setup_message(raid_name: str) -> str:
+    return (
+        f"Hey guys! This weekend will be **{raid_name}**! Please look at the appropriate forum channel "
+        "for a guide or go in blind! Pick your role below and let's get this mount!"
+    )
+
+
+def clean_setup_message(message: str | None) -> str | None:
+    if not message:
+        return None
+
+    cleaned = " ".join(message.strip().split())
+    return cleaned[:1500] if cleaned else None
+
+
 def signup_embed(raid: dict) -> discord.Embed:
     status = []
     if raid["locked"]:
@@ -603,13 +638,15 @@ def signup_embed(raid: dict) -> discord.Embed:
     if raid.get("reminder_offset"):
         status.append(f"{reminder_label(raid['reminder_offset'])} reminder")
     if raid.get("raid_role_name"):
-        status.append(f"{raid['raid_role_name']} ping role")
+        status.append(f"{raid['raid_role_name']} active roster role")
 
     status_text = f"\n**Status:** {', '.join(status)}" if status else ""
+    setup_message = raid.get("setup_message")
+    setup_text = f"\n\n{setup_message}" if setup_message else ""
     embed = discord.Embed(
         title=f"⚔️ {raid_title(raid)}",
         description=(
-            f"{schedule_text(raid)}{status_text}\n\n"
+            f"{schedule_text(raid)}{status_text}{setup_text}\n\n"
             "Choose your light party role below."
         ),
         color=0x3E6AE1,
@@ -750,7 +787,11 @@ async def delete_raid_messages(channel, raid: dict):
         return False
 
     deleted = True
-    for message_id in (raid["signup_message_id"], raid.get("roster_message_id")):
+    for message_id in (
+        raid.get("announcement_message_id"),
+        raid["signup_message_id"],
+        raid.get("roster_message_id"),
+    ):
         if not message_id:
             continue
         try:
@@ -793,6 +834,9 @@ async def create_raid(
     group_name: str | None = None,
     role_restrictions: bool = False,
     raid_role: discord.Role | None = None,
+    setup_message: str | None = None,
+    notify_role: discord.Role | None = None,
+    send_announcement: bool = False,
 ):
     if interaction.channel is None:
         await interaction.followup.send("This command needs to be used in a server channel.", ephemeral=True)
@@ -824,6 +868,10 @@ async def create_raid(
         "reminder_offset": choose_reminder_offset(scheduled_at),
         "raid_role_id": raid_role.id if raid_role else None,
         "raid_role_name": raid_role.name if raid_role else DEFAULT_RAID_ROLE_NAME,
+        "announcement_message_id": None,
+        "setup_message": clean_setup_message(setup_message),
+        "notify_role_id": notify_role.id if notify_role else None,
+        "notify_role_name": notify_role.name if notify_role else None,
     }
 
     if raid_role is None and interaction.guild is not None:
@@ -836,6 +884,24 @@ async def create_raid(
     roster_message = await interaction.channel.send(embed=roster_embed(raid))
     raid["roster_message_id"] = roster_message.id
 
+    announcement_warning = None
+    if send_announcement:
+        announcement_role = notify_role
+        if announcement_role is None and interaction.guild is not None:
+            announcement_role = find_role_by_name(interaction.guild, DEFAULT_NOTIFY_ROLE_NAME)
+
+        if announcement_role is not None:
+            raid["notify_role_id"] = announcement_role.id
+            raid["notify_role_name"] = announcement_role.name
+            announcement_text = raid.get("setup_message") or default_setup_message(raid["raid_name"])
+            announcement_message = await interaction.channel.send(
+                f"{announcement_role.mention} {announcement_text}\n\nRole signup: {signup_message.jump_url}",
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+            raid["announcement_message_id"] = announcement_message.id
+        else:
+            announcement_warning = f" I could not find a role named `{DEFAULT_NOTIFY_ROLE_NAME}` to ping."
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -843,9 +909,10 @@ async def create_raid(
                 signup_message_id, roster_message_id, channel_id, raid_name, date, time,
                 signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                 role_restrictions, group_name, reminders_sent, reminder_offset,
-                raid_role_id, raid_role_name
+                raid_role_id, raid_role_name, announcement_message_id, setup_message,
+                notify_role_id, notify_role_name
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raid["signup_message_id"],
@@ -867,13 +934,17 @@ async def create_raid(
                 raid["reminder_offset"],
                 raid["raid_role_id"],
                 raid["raid_role_name"],
+                raid["announcement_message_id"],
+                raid["setup_message"],
+                raid["notify_role_id"],
+                raid["notify_role_name"],
             ),
         )
         await db.commit()
 
     await update_raid_messages(interaction.channel, raid)
     await interaction.followup.send(
-        f"Raid signup created. Signup message ID: `{raid['signup_message_id']}`",
+        f"Raid signup created. Signup message ID: `{raid['signup_message_id']}`{announcement_warning or ''}",
         ephemeral=True,
     )
 
@@ -1260,6 +1331,40 @@ class RaidSignupView(discord.ui.View):
         await update_raid_messages(channel, raid)
 
 
+@tree.command(name="raidsetup", description="Create a raid signup with a custom message and raid notification ping")
+@app_commands.describe(
+    raid_name="Name of the raid",
+    date="Raid date, such as 5/25, May 25, or 2026-05-25",
+    time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
+    message="Optional message shown in the signup and sent with the notification ping",
+    notify_role=f"Optional role to ping. Defaults to {DEFAULT_NOTIFY_ROLE_NAME}.",
+    group="Optional group or team name, such as Group A",
+)
+async def raidsetup(
+    interaction: discord.Interaction,
+    raid_name: str,
+    date: str,
+    time: str,
+    message: str | None = None,
+    notify_role: discord.Role | None = None,
+    group: str | None = None,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    setup_message = clean_setup_message(message) or default_setup_message(raid_name)
+    await create_raid(
+        interaction,
+        raid_name,
+        date,
+        time,
+        group,
+        False,
+        None,
+        setup_message,
+        notify_role,
+        True,
+    )
+
+
 @tree.command(name="raidsignup", description="Create a custom raid signup")
 @app_commands.describe(
     raid_name="Name of the raid",
@@ -1568,6 +1673,15 @@ async def help_command(interaction: discord.Interaction):
         color=0x5865F2,
     )
     embed.add_field(
+        name="/raidsetup",
+        value=(
+            "Creates a raid signup with a custom message in the signup embed and sends a separate announcement "
+            f"that pings `{DEFAULT_NOTIFY_ROLE_NAME}` by default. This ping role is only notified; players still "
+            f"only receive `{DEFAULT_RAID_ROLE_NAME}` when they pick a roster role."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="/raidsignup",
         value=(
             "Creates a custom raid signup and a live roster post.\n"
@@ -1753,7 +1867,8 @@ async def on_ready():
                 SELECT signup_message_id, roster_message_id, channel_id, raid_name, date, time,
                        signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                        role_restrictions, group_name, reminders_sent, reminder_offset,
-                       raid_role_id, raid_role_name
+                       raid_role_id, raid_role_name, announcement_message_id, setup_message,
+                       notify_role_id, notify_role_name
                 FROM signups
                 """
             ) as cursor:
