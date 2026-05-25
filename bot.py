@@ -17,14 +17,7 @@ DB_PATH = "raids.db"
 views_loaded = False
 reminder_task = None
 DEFAULT_RAID_ROLE_NAME = "FFXIVActiveRoster"
-
-TIMEZONE_CHOICES = [
-    app_commands.Choice(name="Eastern Time", value="ET"),
-    app_commands.Choice(name="Central Time", value="CT"),
-    app_commands.Choice(name="Mountain Time", value="MT"),
-    app_commands.Choice(name="Pacific Time", value="PT"),
-    app_commands.Choice(name="UTC", value="UTC"),
-]
+DEFAULT_TIMEZONE_NAME = "ET"
 
 ROLE_CHOICES = [
     app_commands.Choice(name="Main Tank", value="MT"),
@@ -741,6 +734,36 @@ async def update_raid_messages(channel, raid: dict):
     return True
 
 
+async def fetch_raid_channel(raid: dict):
+    channel = bot.get_channel(raid["channel_id"])
+    if channel is not None:
+        return channel
+
+    try:
+        return await bot.fetch_channel(raid["channel_id"])
+    except (discord.Forbidden, discord.NotFound):
+        return None
+
+
+async def delete_raid_messages(channel, raid: dict):
+    if channel is None:
+        return False
+
+    deleted = True
+    for message_id in (raid["signup_message_id"], raid.get("roster_message_id")):
+        if not message_id:
+            continue
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            deleted = False
+
+    return deleted
+
+
 async def resolve_raid_for_command(interaction: discord.Interaction, signup_message_id: str | None):
     if interaction.channel is None:
         return None, "This command needs to be used in a server channel."
@@ -767,7 +790,6 @@ async def create_raid(
     raid_name: str,
     date: str,
     time: str,
-    timezone_choice: app_commands.Choice[str],
     group_name: str | None = None,
     role_restrictions: bool = False,
     raid_role: discord.Role | None = None,
@@ -777,7 +799,7 @@ async def create_raid(
         return
 
     try:
-        scheduled_at = parse_raid_datetime(date, time, timezone_choice.value)
+        scheduled_at = parse_raid_datetime(date, time, DEFAULT_TIMEZONE_NAME)
     except ValueError as exc:
         await interaction.followup.send(str(exc), ephemeral=True)
         return
@@ -794,7 +816,7 @@ async def create_raid(
         "standby": {},
         "confirmations": [],
         "scheduled_at": scheduled_at,
-        "timezone": timezone_choice.value,
+        "timezone": DEFAULT_TIMEZONE_NAME,
         "locked": False,
         "role_restrictions": role_restrictions,
         "group_name": group_name,
@@ -1243,20 +1265,17 @@ class RaidSignupView(discord.ui.View):
     raid_name="Name of the raid",
     date="Raid date, such as 5/25, May 25, or 2026-05-25",
     time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
-    timezone="Timezone for the time you entered",
     group="Optional group or team name, such as Group A",
 )
-@app_commands.choices(timezone=TIMEZONE_CHOICES)
 async def raidsignup(
     interaction: discord.Interaction,
     raid_name: str,
     date: str,
     time: str,
-    timezone: app_commands.Choice[str],
     group: str | None = None,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await create_raid(interaction, raid_name, date, time, timezone, group, False, None)
+    await create_raid(interaction, raid_name, date, time, group, False, None)
 
 
 @tree.command(name="raidpreset", description="Create a raid signup from a preset raid name")
@@ -1264,20 +1283,18 @@ async def raidsignup(
     preset="Preset raid",
     date="Raid date, such as 5/25, May 25, or 2026-05-25",
     time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
-    timezone="Timezone for the time you entered",
     group="Optional group or team name",
 )
-@app_commands.choices(preset=PRESET_CHOICES, timezone=TIMEZONE_CHOICES)
+@app_commands.choices(preset=PRESET_CHOICES)
 async def raidpreset(
     interaction: discord.Interaction,
     preset: app_commands.Choice[str],
     date: str,
     time: str,
-    timezone: app_commands.Choice[str],
     group: str | None = None,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await create_raid(interaction, preset.value, date, time, timezone, group, False, None)
+    await create_raid(interaction, preset.value, date, time, group, False, None)
 
 
 @tree.command(name="lockroster", description="Lock a roster so players cannot change roles")
@@ -1555,8 +1572,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "Creates a custom raid signup and a live roster post.\n"
             "`raid_name` is the raid name. `date` accepts `5/25`, `May 25`, or `2026-05-25`. `time` accepts `20:00`, "
-            "`8:00 PM`, `8PM`, or `8 PM`. `timezone` is the timezone for the time you typed. "
-            "`group` is optional for Group A/B style coordination."
+            "`8:00 PM`, `8PM`, or `8 PM`. Times default to Eastern Time. `group` is optional for Group A/B style coordination."
         ),
         inline=False,
     )
@@ -1665,16 +1681,20 @@ async def send_due_reminders():
         if not scheduled_at:
             continue
 
-        channel = bot.get_channel(raid["channel_id"])
+        channel = await fetch_raid_channel(raid)
 
-        if now >= scheduled_at + (2 * 60 * 60) and not raid["reminders_sent"].get("role_cleanup"):
+        if now >= scheduled_at + (2 * 60 * 60) and not raid["reminders_sent"].get("post_raid_delete"):
             if channel is not None:
                 guild = getattr(channel, "guild", None)
                 for player in raid["signups"].values():
                     await remove_raid_role_from_player(guild, raid, player)
 
-            raid["reminders_sent"]["role_cleanup"] = True
-            await save_raid_state(raid)
+                if await delete_raid_messages(channel, raid):
+                    await delete_raid_row(raid["signup_message_id"])
+                else:
+                    print(f"Post-raid cleanup could not delete messages for {raid['signup_message_id']}")
+            else:
+                print(f"Post-raid cleanup could not access channel for {raid['signup_message_id']}")
             continue
 
         if now > scheduled_at:
