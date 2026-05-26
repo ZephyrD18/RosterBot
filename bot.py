@@ -18,7 +18,7 @@ views_loaded = False
 reminder_task = None
 DEFAULT_RAID_ROLE_NAME = "FFXIVActiveRoster"
 DEFAULT_NOTIFY_ROLE_NAME = "FFXIV Raid"
-DEFAULT_TIMEZONE_NAME = "ET"
+DEFAULT_TIMEZONE_NAME = "PT"
 
 ROLE_CHOICES = [
     app_commands.Choice(name="Main Tank", value="MT"),
@@ -459,13 +459,14 @@ async def save_raid_state(raid: dict):
         await db.execute(
             """
             UPDATE signups
-            SET signups = ?, waitlist = ?, standby = ?, confirmations = ?, locked = ?,
+            SET roster_message_id = ?, signups = ?, waitlist = ?, standby = ?, confirmations = ?, locked = ?,
                 role_restrictions = ?, group_name = ?, reminders_sent = ?, reminder_offset = ?,
                 raid_role_id = ?, raid_role_name = ?, announcement_message_id = ?,
                 setup_message = ?, notify_role_id = ?, notify_role_name = ?
             WHERE signup_message_id = ?
             """,
             (
+                raid.get("roster_message_id"),
                 encode_json(raid["signups"]),
                 encode_json(raid["waitlist"]),
                 encode_json(raid["standby"]),
@@ -1574,6 +1575,40 @@ async def raidrole(
     await interaction.followup.send(message, ephemeral=True)
 
 
+@tree.command(name="bumproster", description="Move the roster post to the bottom of the channel")
+@app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
+async def bumproster(interaction: discord.Interaction, signup_message_id: str | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    allowed, error = require_roster_manager(interaction)
+    if not allowed:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    raid, error = await resolve_raid_for_command(interaction, signup_message_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    old_roster_message_id = raid.get("roster_message_id")
+    if old_roster_message_id:
+        try:
+            old_roster_message = await interaction.channel.fetch_message(old_roster_message_id)
+            await old_roster_message.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I could not delete the old roster post. Make sure I can manage messages in this channel.",
+                ephemeral=True,
+            )
+            return
+
+    new_roster_message = await interaction.channel.send(embed=roster_embed(raid))
+    raid["roster_message_id"] = new_roster_message.id
+    await save_raid_state(raid)
+    await interaction.followup.send(f"Bumped the roster for **{raid_title(raid)}**.", ephemeral=True)
+
+
 @tree.command(name="clearroster", description="Clear a raid roster and remove assigned raid roles")
 @app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
 async def clearroster(interaction: discord.Interaction, signup_message_id: str | None = None):
@@ -1686,7 +1721,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "Creates a custom raid signup and a live roster post.\n"
             "`raid_name` is the raid name. `date` accepts `5/25`, `May 25`, or `2026-05-25`. `time` accepts `20:00`, "
-            "`8:00 PM`, `8PM`, or `8 PM`. Times default to Eastern Time. `group` is optional for Group A/B style coordination."
+            "`8:00 PM`, `8PM`, or `8 PM`. Times default to Pacific Time. `group` is optional for Group A/B style coordination."
         ),
         inline=False,
     )
@@ -1729,6 +1764,14 @@ async def help_command(interaction: discord.Interaction):
             "`/clearroster` removes assigned raid roles and resets the roster while keeping the bot posts. "
             "`/deleteroster` removes assigned raid roles, deletes the signup and roster posts, and removes the saved roster. "
             "`/deleteraid` also deletes both bot posts and the saved roster. Requires Manage Messages."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/bumproster",
+        value=(
+            "Deletes the old roster post and reposts the same current roster at the bottom of the channel. "
+            "The saved roster data stays intact. Requires Manage Messages."
         ),
         inline=False,
     )
