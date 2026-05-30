@@ -2,6 +2,7 @@ import ast
 import asyncio
 import json
 import os
+import random
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
 import aiosqlite
@@ -81,6 +82,17 @@ REMINDER_WINDOWS = [
     (12 * 60 * 60, "12 hours"),
     (8 * 60 * 60, "8 hours"),
     (6 * 60 * 60, "6 hours"),
+]
+FIVE_MINUTE_REMINDER_SECONDS = 5 * 60
+FIVE_MINUTE_MESSAGES = [
+    "Happy mount farming!",
+    "Let's get that clear and that shiny prize!",
+    "Good vibes, clean pulls, big loot!",
+    "Bring your snacks and your best rotations!",
+    "May the drops be kind and the mechanics be readable!",
+    "Time to make this boss regret the queue pop!",
+    "You've got this. Let's make it a smooth run!",
+    "Mount luck is officially being summoned!",
 ]
 
 
@@ -295,6 +307,16 @@ def reminder_ping_text(channel, raid: dict) -> str:
     return signed_player_mentions(raid["signups"])
 
 
+def five_minute_ping_text(channel, raid: dict) -> str:
+    guild = getattr(channel, "guild", None)
+    role = raid_role_for_guild(guild, raid)
+    return role.mention if role else signed_player_mentions(raid["signups"])
+
+
+def meeting_server_text(raid: dict) -> str:
+    return raid.get("meeting_server") or "the planned meeting server"
+
+
 def require_roster_manager(interaction: discord.Interaction) -> tuple[bool, str | None]:
     if not isinstance(interaction.user, discord.Member):
         return False, "I could not confirm your server permissions."
@@ -333,7 +355,8 @@ async def init_db():
                 announcement_message_id INTEGER,
                 setup_message TEXT,
                 notify_role_id INTEGER,
-                notify_role_name TEXT
+                notify_role_name TEXT,
+                meeting_server TEXT
             )
             """
         )
@@ -365,6 +388,7 @@ async def init_db():
             ("setup_message", "TEXT"),
             ("notify_role_id", "INTEGER"),
             ("notify_role_name", "TEXT"),
+            ("meeting_server", "TEXT"),
         )
         for column_name, column_type in migrations:
             if column_name not in columns:
@@ -401,6 +425,7 @@ def raid_from_row(row) -> dict | None:
         "setup_message": row[20],
         "notify_role_id": row[21],
         "notify_role_name": row[22],
+        "meeting_server": row[23],
     }
 
 
@@ -412,7 +437,7 @@ async def fetch_signup(signup_message_id: int):
                    signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                    role_restrictions, group_name, reminders_sent, reminder_offset,
                    raid_role_id, raid_role_name, announcement_message_id, setup_message,
-                   notify_role_id, notify_role_name
+                   notify_role_id, notify_role_name, meeting_server
             FROM signups
             WHERE signup_message_id = ?
             """,
@@ -446,7 +471,7 @@ async def fetch_scheduled_raids():
                    signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                    role_restrictions, group_name, reminders_sent, reminder_offset,
                    raid_role_id, raid_role_name, announcement_message_id, setup_message,
-                   notify_role_id, notify_role_name
+                   notify_role_id, notify_role_name, meeting_server
             FROM signups
             WHERE scheduled_at IS NOT NULL
             """,
@@ -462,7 +487,7 @@ async def save_raid_state(raid: dict):
             SET roster_message_id = ?, signups = ?, waitlist = ?, standby = ?, confirmations = ?, locked = ?,
                 role_restrictions = ?, group_name = ?, reminders_sent = ?, reminder_offset = ?,
                 raid_role_id = ?, raid_role_name = ?, announcement_message_id = ?,
-                setup_message = ?, notify_role_id = ?, notify_role_name = ?
+                setup_message = ?, notify_role_id = ?, notify_role_name = ?, meeting_server = ?
             WHERE signup_message_id = ?
             """,
             (
@@ -482,6 +507,7 @@ async def save_raid_state(raid: dict):
                 raid.get("setup_message"),
                 raid.get("notify_role_id"),
                 raid.get("notify_role_name"),
+                raid.get("meeting_server"),
                 raid["signup_message_id"],
             ),
         )
@@ -589,10 +615,11 @@ def parse_raid_datetime(date_text: str, time_text: str, timezone_name: str) -> i
 
 
 def schedule_text(raid: dict) -> str:
+    meeting_text = f"\n**Meeting Server:** {raid['meeting_server']}" if raid.get("meeting_server") else ""
     if raid.get("scheduled_at"):
-        return f"**When:** <t:{raid['scheduled_at']}:F>\n**Countdown:** <t:{raid['scheduled_at']}:R>"
+        return f"**When:** <t:{raid['scheduled_at']}:F>\n**Countdown:** <t:{raid['scheduled_at']}:R>{meeting_text}"
 
-    return f"**Date:** {raid['date']}\n**Gather Time:** {raid['time']}"
+    return f"**Date:** {raid['date']}\n**Gather Time:** {raid['time']}{meeting_text}"
 
 
 def choose_reminder_offset(scheduled_at: int) -> int | None:
@@ -838,6 +865,7 @@ async def create_raid(
     setup_message: str | None = None,
     notify_role: discord.Role | None = None,
     send_announcement: bool = False,
+    meeting_server: str | None = None,
 ):
     if interaction.channel is None:
         await interaction.followup.send("This command needs to be used in a server channel.", ephemeral=True)
@@ -873,6 +901,7 @@ async def create_raid(
         "setup_message": clean_setup_message(setup_message),
         "notify_role_id": notify_role.id if notify_role else None,
         "notify_role_name": notify_role.name if notify_role else None,
+        "meeting_server": clean_setup_message(meeting_server),
     }
 
     if raid_role is None and interaction.guild is not None:
@@ -911,9 +940,9 @@ async def create_raid(
                 signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                 role_restrictions, group_name, reminders_sent, reminder_offset,
                 raid_role_id, raid_role_name, announcement_message_id, setup_message,
-                notify_role_id, notify_role_name
+                notify_role_id, notify_role_name, meeting_server
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raid["signup_message_id"],
@@ -939,6 +968,7 @@ async def create_raid(
                 raid["setup_message"],
                 raid["notify_role_id"],
                 raid["notify_role_name"],
+                raid["meeting_server"],
             ),
         )
         await db.commit()
@@ -1337,6 +1367,7 @@ class RaidSignupView(discord.ui.View):
     raid_name="Name of the raid",
     date="Raid date, such as 5/25, May 25, or 2026-05-25",
     time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
+    meeting_server="Optional server/world where everyone should gather",
     message="Optional message shown in the signup and sent with the notification ping",
     notify_role=f"Optional role to ping. Defaults to {DEFAULT_NOTIFY_ROLE_NAME}.",
     group="Optional group or team name, such as Group A",
@@ -1346,6 +1377,7 @@ async def raidsetup(
     raid_name: str,
     date: str,
     time: str,
+    meeting_server: str | None = None,
     message: str | None = None,
     notify_role: discord.Role | None = None,
     group: str | None = None,
@@ -1363,6 +1395,7 @@ async def raidsetup(
         setup_message,
         notify_role,
         True,
+        meeting_server,
     )
 
 
@@ -1654,14 +1687,7 @@ async def deleteroster(interaction: discord.Interaction, signup_message_id: str 
     for player in raid["signups"].values():
         await remove_raid_role_from_player(interaction.guild, raid, player)
 
-    for message_id in (raid["signup_message_id"], raid.get("roster_message_id")):
-        if not message_id:
-            continue
-        try:
-            message = await interaction.channel.fetch_message(message_id)
-            await message.delete()
-        except (discord.Forbidden, discord.NotFound):
-            pass
+    await delete_raid_messages(interaction.channel, raid)
 
     await delete_raid_row(raid["signup_message_id"])
     await interaction.followup.send(f"Deleted roster for **{raid_title(raid)}**.", ephemeral=True)
@@ -1684,14 +1710,7 @@ async def deleteraid(interaction: discord.Interaction, signup_message_id: str | 
     for player in raid["signups"].values():
         await remove_raid_role_from_player(interaction.guild, raid, player)
 
-    for message_id in (raid["signup_message_id"], raid.get("roster_message_id")):
-        if not message_id:
-            continue
-        try:
-            message = await interaction.channel.fetch_message(message_id)
-            await message.delete()
-        except (discord.Forbidden, discord.NotFound):
-            pass
+    await delete_raid_messages(interaction.channel, raid)
 
     await delete_raid_row(raid["signup_message_id"])
     await interaction.followup.send(f"Deleted **{raid_title(raid)}**.", ephemeral=True)
@@ -1712,7 +1731,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "Creates a raid signup with a custom message in the signup embed and sends a separate announcement "
             f"that pings `{DEFAULT_NOTIFY_ROLE_NAME}` by default. This ping role is only notified; players still "
-            f"only receive `{DEFAULT_RAID_ROLE_NAME}` when they pick a roster role."
+            f"only receive `{DEFAULT_RAID_ROLE_NAME}` when they pick a roster role. `meeting_server` is used for "
+            "the 5-minute raid-start ping."
         ),
         inline=False,
     )
@@ -1812,8 +1832,9 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "The bot sends one automatic reminder only. It chooses the longest available reminder window: "
             "24 hours, otherwise 12 hours, otherwise 8 hours, otherwise 6 hours before raid time. "
-            "The reminder pings the configured raid role. Two hours after raid start, the bot removes "
-            "that role from signed players. The bot must be running for reminders and cleanup."
+            "The reminder pings the configured raid role. It also sends a separate 5-minute ping with the "
+            "meeting server and a random cheerful message. Two hours after raid start, the bot removes "
+            "the raid role from signed players. The bot must be running for reminders and cleanup."
         ),
         inline=False,
     )
@@ -1861,6 +1882,25 @@ async def send_due_reminders():
         if reminder_offset is None:
             reminder_offset = choose_reminder_offset(scheduled_at)
             raid["reminder_offset"] = reminder_offset
+            await save_raid_state(raid)
+
+        if (
+            channel is not None
+            and not raid["reminders_sent"].get("five_minute")
+            and scheduled_at - FIVE_MINUTE_REMINDER_SECONDS <= now <= scheduled_at
+        ):
+            try:
+                ping_text = five_minute_ping_text(channel, raid)
+                cheerful_message = random.choice(FIVE_MINUTE_MESSAGES)
+                await channel.send(
+                    f"{ping_text}, there are 5 minutes remaining until **{raid_title(raid)}** starts! "
+                    f"We are gathering in **{meeting_server_text(raid)}**! {cheerful_message}",
+                    allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+                )
+            except discord.Forbidden:
+                continue
+
+            raid["reminders_sent"]["five_minute"] = True
             await save_raid_state(raid)
 
         if not reminder_offset or raid["reminders_sent"].get("automatic"):
@@ -1911,7 +1951,7 @@ async def on_ready():
                        signups, waitlist, standby, confirmations, scheduled_at, timezone, locked,
                        role_restrictions, group_name, reminders_sent, reminder_offset,
                        raid_role_id, raid_role_name, announcement_message_id, setup_message,
-                       notify_role_id, notify_role_name
+                       notify_role_id, notify_role_name, meeting_server
                 FROM signups
                 """
             ) as cursor:
