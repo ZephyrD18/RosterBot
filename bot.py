@@ -313,8 +313,20 @@ def five_minute_ping_text(channel, raid: dict) -> str:
     return role.mention if role else signed_player_mentions(raid["signups"])
 
 
-def meeting_server_text(raid: dict) -> str:
-    return raid.get("meeting_server") or "the planned meeting server"
+def five_minute_reminder_text(channel, raid: dict) -> str:
+    ping_text = five_minute_ping_text(channel, raid)
+    cheerful_message = random.choice(FIVE_MINUTE_MESSAGES)
+    if raid.get("meeting_server"):
+        return (
+            f"{ping_text}, there are 5 minutes remaining until **{raid_title(raid)}** starts! "
+            f"We are gathering in **{raid['meeting_server']}**! {cheerful_message}"
+        )
+
+    return (
+        f"{ping_text}, there are 5 minutes remaining until **{raid_title(raid)}** starts! "
+        f"Join the VC to figure out where the raid group is meeting! {cheerful_message}"
+    )
+
 
 
 def require_roster_manager(interaction: discord.Interaction) -> tuple[bool, str | None]:
@@ -1399,24 +1411,6 @@ async def raidsetup(
     )
 
 
-@tree.command(name="raidsignup", description="Create a custom raid signup")
-@app_commands.describe(
-    raid_name="Name of the raid",
-    date="Raid date, such as 5/25, May 25, or 2026-05-25",
-    time="Raid time, such as 20:00, 8:00 PM, 8PM, or 8 PM",
-    group="Optional group or team name, such as Group A",
-)
-async def raidsignup(
-    interaction: discord.Interaction,
-    raid_name: str,
-    date: str,
-    time: str,
-    group: str | None = None,
-):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    await create_raid(interaction, raid_name, date, time, group, False, None)
-
-
 @tree.command(name="raidpreset", description="Create a raid signup from a preset raid name")
 @app_commands.describe(
     preset="Preset raid",
@@ -1737,15 +1731,6 @@ async def help_command(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="/raidsignup",
-        value=(
-            "Creates a custom raid signup and a live roster post.\n"
-            "`raid_name` is the raid name. `date` accepts `5/25`, `May 25`, or `2026-05-25`. `time` accepts `20:00`, "
-            "`8:00 PM`, `8PM`, or `8 PM`. Times default to Pacific Time. `group` is optional for Group A/B style coordination."
-        ),
-        inline=False,
-    )
-    embed.add_field(
         name="/raidpreset",
         value=(
             "Creates the same signup using a preset raid name, such as Everkeep EX, M4S, or FRU. "
@@ -1890,11 +1875,8 @@ async def send_due_reminders():
             and scheduled_at - FIVE_MINUTE_REMINDER_SECONDS <= now <= scheduled_at
         ):
             try:
-                ping_text = five_minute_ping_text(channel, raid)
-                cheerful_message = random.choice(FIVE_MINUTE_MESSAGES)
                 await channel.send(
-                    f"{ping_text}, there are 5 minutes remaining until **{raid_title(raid)}** starts! "
-                    f"We are gathering in **{meeting_server_text(raid)}**! {cheerful_message}",
+                    five_minute_reminder_text(channel, raid),
                     allowed_mentions=discord.AllowedMentions(roles=True, users=True),
                 )
             except discord.Forbidden:
