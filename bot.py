@@ -1348,23 +1348,36 @@ class RaidSignupView(discord.ui.View):
             return
 
         user_id = interaction.user.id
+        removed_role_label = None
+        removed_from_standby = False
+
         for role_key, player in list(raid["signups"].items()):
             if player.get("user_id") == user_id:
                 del raid["signups"][role_key]
                 raid["confirmations"] = [uid for uid in raid["confirmations"] if uid != user_id]
+                removed_role_label = ROLE_LABELS.get(role_key, role_key)
                 if isinstance(interaction.user, discord.Member):
                     await remove_raid_role(interaction.user, raid)
-                await save_raid_state(raid)
-                await self.refresh_messages(interaction, raid)
+                break
 
-                role_label = ROLE_LABELS.get(role_key, role_key)
-                await interaction.followup.send(
-                    f"You have resigned the position of **{role_label}**.",
-                    ephemeral=True,
-                )
-                return
+        if remove_user_from_standby(raid["standby"], user_id):
+            removed_from_standby = True
 
-        await interaction.followup.send("You're not registered for any role.", ephemeral=True)
+        if removed_role_label or removed_from_standby:
+            await save_raid_state(raid)
+            await self.refresh_messages(interaction, raid)
+
+            if removed_role_label and removed_from_standby:
+                message = "You have resigned from the roster entirely."
+            elif removed_role_label:
+                message = f"You've resigned from the roster as **{removed_role_label}**."
+            else:
+                message = "You have resigned from the Standby List."
+
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        await interaction.followup.send("You're not registered for any role or standby.", ephemeral=True)
 
     async def refresh_messages(self, interaction: discord.Interaction, raid: dict):
         channel = interaction.channel
