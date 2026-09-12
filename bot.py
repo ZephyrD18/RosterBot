@@ -616,6 +616,46 @@ async def save_raid_state(raid: dict):
         await db.commit()
 
 
+async def insert_raid(raid: dict) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO signups (
+                signup_message_id, roster_message_id, channel_id, raid_name, date, time,
+                signups, standby, scheduled_at, timezone, locked,
+                group_name, reminders_sent, reminder_offset,
+                raid_role_id, raid_role_name, announcement_message_id, setup_message,
+                notify_role_id, notify_role_name, meeting_server
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                raid["signup_message_id"],
+                raid["roster_message_id"],
+                raid["channel_id"],
+                raid["raid_name"],
+                raid["date"],
+                raid["time"],
+                encode_json(raid["signups"]),
+                encode_json(raid["standby"]),
+                raid["scheduled_at"],
+                raid["timezone"],
+                int(raid["locked"]),
+                raid["group_name"],
+                encode_json(raid["reminders_sent"]),
+                raid["reminder_offset"],
+                raid["raid_role_id"],
+                raid["raid_role_name"],
+                raid["announcement_message_id"],
+                raid["setup_message"],
+                raid["notify_role_id"],
+                raid["notify_role_name"],
+                raid["meeting_server"],
+            ),
+        )
+        await db.commit()
+
+
 async def save_reminder_state(raid: dict):
     """Save scheduler fields without overwriting newer roster selections."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1056,114 +1096,107 @@ async def create_raid(
         if existing_role:
             raid["raid_role_id"] = existing_role.id
 
-    announcement_warning = None
-    created_messages = []
+    setup_warnings = []
     try:
         signup_message = await interaction.channel.send(embed=signup_embed(raid))
-        created_messages.append(signup_message)
         raid["signup_message_id"] = signup_message.id
-
-        if send_announcement:
-            announcement_role = notify_role or find_role_by_name(interaction.guild, DEFAULT_NOTIFY_ROLE_NAME)
-            announcement_text = raid.get("setup_message") or default_setup_message(raid["raid_name"])
-            announcement_prefix = ""
-            allowed_mentions = discord.AllowedMentions.none()
-
-            if announcement_role is not None:
-                raid["notify_role_id"] = announcement_role.id
-                raid["notify_role_name"] = announcement_role.name
-                announcement_prefix = f"{announcement_role.mention} "
-                allowed_mentions = discord.AllowedMentions(
-                    everyone=False,
-                    users=False,
-                    roles=[announcement_role],
-                    replied_user=False,
-                )
-            else:
-                announcement_warning = f" I could not find a role named `{DEFAULT_NOTIFY_ROLE_NAME}` to ping."
-
-            announcement_message = await interaction.channel.send(
-                f"{announcement_prefix}{announcement_text}\n\nRole signup: {signup_message.jump_url}",
-                allowed_mentions=allowed_mentions,
-            )
-            created_messages.append(announcement_message)
-            raid["announcement_message_id"] = announcement_message.id
-
-        roster_message = await interaction.channel.send(embed=roster_embed(raid))
-        created_messages.append(roster_message)
-        raid["roster_message_id"] = roster_message.id
     except discord.HTTPException as exc:
-        await delete_created_messages(created_messages, "raid setup failed")
         logger.error(
-            "Could not create raid messages",
+            "Could not create signup message",
             exc_info=(type(exc), exc, exc.__traceback__),
         )
         await interaction.followup.send(
-            "I could not create the raid posts. Check my View Channel, Send Messages, and Embed Links permissions.",
+            "I could not create the signup post. Check my View Channel, Send Messages, and Embed Links permissions.",
             ephemeral=True,
         )
         return
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """
-                INSERT INTO signups (
-                    signup_message_id, roster_message_id, channel_id, raid_name, date, time,
-                    signups, standby, scheduled_at, timezone, locked,
-                    group_name, reminders_sent, reminder_offset,
-                    raid_role_id, raid_role_name, announcement_message_id, setup_message,
-                    notify_role_id, notify_role_name, meeting_server
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    raid["signup_message_id"],
-                    raid["roster_message_id"],
-                    raid["channel_id"],
-                    raid["raid_name"],
-                    raid["date"],
-                    raid["time"],
-                    encode_json(raid["signups"]),
-                    encode_json(raid["standby"]),
-                    raid["scheduled_at"],
-                    raid["timezone"],
-                    int(raid["locked"]),
-                    raid["group_name"],
-                    encode_json(raid["reminders_sent"]),
-                    raid["reminder_offset"],
-                    raid["raid_role_id"],
-                    raid["raid_role_name"],
-                    raid["announcement_message_id"],
-                    raid["setup_message"],
-                    raid["notify_role_id"],
-                    raid["notify_role_name"],
-                    raid["meeting_server"],
-                ),
-            )
-            await db.commit()
+        await insert_raid(raid)
     except aiosqlite.Error as exc:
-        await delete_created_messages(created_messages, "database failure")
+        await delete_created_messages([signup_message], "database failure")
         logger.error(
             "Could not save new raid %s",
             raid["signup_message_id"],
             exc_info=(type(exc), exc, exc.__traceback__),
         )
-        await interaction.followup.send("The raid posts could not be saved. Please try again.", ephemeral=True)
+        await interaction.followup.send("The raid signup could not be saved. Please try again.", ephemeral=True)
         return
+
+    if send_announcement:
+        announcement_role = notify_role or find_role_by_name(interaction.guild, DEFAULT_NOTIFY_ROLE_NAME)
+        announcement_text = raid.get("setup_message") or default_setup_message(raid["raid_name"])
+        announcement_prefix = ""
+        allowed_mentions = discord.AllowedMentions.none()
+
+        if announcement_role is not None:
+            raid["notify_role_id"] = announcement_role.id
+            raid["notify_role_name"] = announcement_role.name
+            announcement_prefix = f"{announcement_role.mention} "
+            allowed_mentions = discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[announcement_role],
+                replied_user=False,
+            )
+        else:
+            setup_warnings.append(f"I could not find a role named `{DEFAULT_NOTIFY_ROLE_NAME}` to ping.")
+
+        try:
+            announcement_message = await interaction.channel.send(
+                f"{announcement_prefix}{announcement_text}\n\nRole signup: {signup_message.jump_url}",
+                allowed_mentions=allowed_mentions,
+            )
+            raid["announcement_message_id"] = announcement_message.id
+            await save_raid_state(raid)
+        except discord.HTTPException as exc:
+            logger.error(
+                "Could not create announcement message for %s",
+                raid["signup_message_id"],
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            setup_warnings.append("The signup was saved, but I could not send the announcement message.")
+        except aiosqlite.Error as exc:
+            await delete_created_messages([announcement_message], "announcement database update failed")
+            raid["announcement_message_id"] = None
+            logger.error(
+                "Could not save announcement message for %s",
+                raid["signup_message_id"],
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            setup_warnings.append("The signup was saved, but I could not save the announcement message.")
+
+    try:
+        roster_message = await interaction.channel.send(embed=roster_embed(raid))
+        raid["roster_message_id"] = roster_message.id
+        await save_raid_state(raid)
+    except discord.HTTPException as exc:
+        logger.error(
+            "Could not create roster message for %s",
+            raid["signup_message_id"],
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        setup_warnings.append("The signup was saved, but I could not create the roster message.")
+    except aiosqlite.Error as exc:
+        await delete_created_messages([roster_message], "roster database update failed")
+        raid["roster_message_id"] = 0
+        logger.error(
+            "Could not save roster message for %s",
+            raid["signup_message_id"],
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        setup_warnings.append("The signup was saved, but I could not save the roster message.")
 
     try:
         await signup_message.edit(embed=signup_embed(raid), view=RaidSignupView(raid))
     except discord.HTTPException:
         logger.exception("Could not activate signup buttons for %s", raid["signup_message_id"])
-        announcement_warning = (
-            f"{announcement_warning or ''} I created the posts but could not activate the signup buttons."
-        )
+        setup_warnings.append("I created the signup but could not activate its buttons.")
 
-    await interaction.followup.send(
-        f"Raid signup created. Signup message ID: `{raid['signup_message_id']}`{announcement_warning or ''}",
-        ephemeral=True,
-    )
+    response = f"Raid signup created. Signup message ID: `{raid['signup_message_id']}`"
+    if setup_warnings:
+        response += "\n" + "\n".join(f"- {warning}" for warning in setup_warnings)
+    await interaction.followup.send(response, ephemeral=True)
 
 
 class MountNeedView(ErrorHandledView):

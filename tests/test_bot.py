@@ -28,12 +28,19 @@ class FakeMessage:
 
 
 class FakeChannel:
-    def __init__(self):
+    def __init__(self, fail_on_send: int | None = None):
         self.id = 789
         self.guild = FakeGuild()
         self.messages = []
+        self.fail_on_send = fail_on_send
+        self.send_attempts = 0
 
     async def send(self, content=None, *, embed=None, **kwargs):
+        self.send_attempts += 1
+        if self.send_attempts == self.fail_on_send:
+            response = type("FakeHTTPResponse", (), {"status": 500, "reason": "Test failure"})()
+            raise bot.discord.HTTPException(response, "Simulated Discord failure")
+
         message = FakeMessage(len(self.messages) + 1, content=content, embed=embed)
         self.messages.append(message)
         return message
@@ -67,8 +74,8 @@ class FakeResponse:
 
 
 class FakeInteraction:
-    def __init__(self):
-        self.channel = FakeChannel()
+    def __init__(self, fail_on_send: int | None = None):
+        self.channel = FakeChannel(fail_on_send=fail_on_send)
         self.guild = self.channel.guild
         self.channel_id = self.channel.id
         self.followup = FakeFollowup()
@@ -233,6 +240,26 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         raid = await bot.fetch_signup(interaction.channel.messages[0].id)
         self.assertEqual(raid["announcement_message_id"], interaction.channel.messages[1].id)
         self.assertEqual(raid["roster_message_id"], interaction.channel.messages[2].id)
+
+    async def test_failed_announcement_does_not_delete_saved_signup(self):
+        interaction = FakeInteraction(fail_on_send=2)
+
+        with self.assertLogs("rosterbot", level="ERROR"):
+            await bot.create_raid(
+                interaction,
+                "Recollection EX",
+                "12/31/2099",
+                "10PM",
+                setup_message="Pick a role and get ready!",
+                send_announcement=True,
+            )
+
+        self.assertEqual(len(interaction.channel.messages), 2)
+        self.assertTrue(all(not message.deleted for message in interaction.channel.messages))
+        raid = await bot.fetch_signup(interaction.channel.messages[0].id)
+        self.assertIsNotNone(raid)
+        self.assertIsNone(raid["announcement_message_id"])
+        self.assertEqual(raid["roster_message_id"], interaction.channel.messages[1].id)
 
     async def test_help_embed_stays_within_discord_limits(self):
         interaction = FakeInteraction()
