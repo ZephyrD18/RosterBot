@@ -47,6 +47,7 @@ class FakeChannel:
 
 
 class FakeGuild:
+    id = 1
     roles = []
 
 
@@ -88,6 +89,7 @@ def sample_raid() -> dict:
         "signup_message_id": 123,
         "roster_message_id": 456,
         "channel_id": 789,
+        "guild_id": 1,
         "raid_name": "Recollection EX",
         "date": "9/12/2026",
         "time": "10PM",
@@ -122,25 +124,27 @@ class RosterFormattingTests(unittest.TestCase):
         self.assertFalse(bot.remove_user_from_standby(standby, 42))
         self.assertEqual(standby, {})
 
-    def test_signup_embed_does_not_repeat_announcement_message(self):
-        embed = bot.signup_embed(sample_raid())
+    def test_roster_card_does_not_repeat_announcement_message(self):
+        embed = bot.roster_embed(sample_raid())
 
         self.assertNotIn("This belongs only in the announcement.", embed.description)
-        self.assertIn("Choose your light party role below.", embed.description)
+        self.assertIn("Choose a role, pick your job", embed.description)
 
-    def test_filled_open_slot_is_struck_through(self):
+    def test_roster_card_shows_occupancy_and_job(self):
         raid = sample_raid()
         raid["signups"]["MT"] = {
             "user_id": 42,
             "display_name": "Tester",
             "mention": "<@42>",
             "needs_mount": True,
+            "job": "Warrior",
         }
 
         embed = bot.roster_embed(raid)
-        open_slots = next(field.value for field in embed.fields if "Open Slots" in field.name)
-
-        self.assertIn("~~Main Tank~~, Off Tank", open_slots)
+        tanks = next(field.value for field in embed.fields if field.name == "Tanks")
+        self.assertIn("1/8 signed up", embed.description)
+        self.assertIn("Warrior", tanks)
+        self.assertNotIn("Open Slots", [field.name for field in embed.fields])
 
     def test_large_standby_list_stays_within_discord_field_limit(self):
         lines = [f"<@{user_id}> - Any - Needs Mount" for user_id in range(1000, 1100)]
@@ -220,7 +224,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(row[1]), {"automatic": True})
         self.assertEqual(row[2], 43200)
 
-    async def test_create_raid_saves_all_posts_and_keeps_roster_last(self):
+    async def test_create_raid_saves_one_card_and_separate_announcement(self):
         interaction = FakeInteraction()
 
         await bot.create_raid(
@@ -233,13 +237,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             meeting_server="Seraph",
         )
 
-        self.assertEqual(len(interaction.channel.messages), 3)
+        self.assertEqual(len(interaction.channel.messages), 2)
         self.assertIsNotNone(interaction.channel.messages[0].view)
         self.assertIn("Pick a role and get ready!", interaction.channel.messages[1].content)
 
         raid = await bot.fetch_signup(interaction.channel.messages[0].id)
         self.assertEqual(raid["announcement_message_id"], interaction.channel.messages[1].id)
-        self.assertEqual(raid["roster_message_id"], interaction.channel.messages[2].id)
+        self.assertIsNone(raid["roster_message_id"])
+        self.assertEqual(raid["duration_minutes"], 180)
 
     async def test_failed_announcement_does_not_delete_saved_signup(self):
         interaction = FakeInteraction(fail_on_send=2)
@@ -254,12 +259,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 send_announcement=True,
             )
 
-        self.assertEqual(len(interaction.channel.messages), 2)
+        self.assertEqual(len(interaction.channel.messages), 1)
         self.assertTrue(all(not message.deleted for message in interaction.channel.messages))
         raid = await bot.fetch_signup(interaction.channel.messages[0].id)
         self.assertIsNotNone(raid)
         self.assertIsNone(raid["announcement_message_id"])
-        self.assertEqual(raid["roster_message_id"], interaction.channel.messages[1].id)
+        self.assertIsNone(raid["roster_message_id"])
 
     async def test_help_embed_stays_within_discord_limits(self):
         interaction = FakeInteraction()

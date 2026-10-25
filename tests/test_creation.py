@@ -23,7 +23,7 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
         ) for message_id in (123, 456, 789)]
         self.interaction = SimpleNamespace(
             channel=SimpleNamespace(send=AsyncMock(side_effect=self.messages)),
-            channel_id=789, guild=SimpleNamespace(roles=[]),
+            channel_id=789, guild=SimpleNamespace(id=1, roles=[]),
             followup=SimpleNamespace(send=AsyncMock()),
         )
 
@@ -79,17 +79,16 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await bot.fetch_signup(123))
         self.assertIn("could not be saved", self.interaction.followup.send.call_args.args[0])
 
-    async def test_roster_save_failure_rolls_back_only_the_roster(self):
-        with patch.object(bot, "save_raid_state", side_effect=aiosqlite.OperationalError("Test failure")):
-            with self.assertLogs("rosterbot", level="ERROR"):
-                await bot.create_raid(self.interaction, "Test raid", "12/31/2099", "8PM")
-
+    async def test_button_activation_failure_keeps_the_saved_card_for_repair(self):
+        response = SimpleNamespace(status=500, reason="Unavailable")
+        self.messages[0].edit.side_effect = bot.discord.HTTPException(response, "Unavailable")
+        with self.assertLogs("rosterbot", level="ERROR"):
+            await bot.create_raid(self.interaction, "Test raid", "12/31/2099", "8PM")
         self.messages[0].delete.assert_not_awaited()
-        self.messages[1].delete.assert_awaited_once()
-        self.messages[0].edit.assert_awaited_once()
-        self.assertEqual((await bot.fetch_signup(123))["roster_message_id"], 0)
+        self.assertIsNotNone(await bot.fetch_signup(123))
+        self.assertIn("could not activate", self.interaction.followup.send.await_args.args[0])
 
-    async def test_announcement_save_failure_still_saves_the_roster(self):
+    async def test_announcement_save_failure_keeps_the_canonical_roster(self):
         save_raid_state = bot.save_raid_state
         first_save = True
 
@@ -108,7 +107,7 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
 
         raid = await bot.fetch_signup(123)
         self.assertIsNone(raid["announcement_message_id"])
-        self.assertEqual(raid["roster_message_id"], 789)
+        self.assertIsNone(raid["roster_message_id"])
         self.messages[1].delete.assert_awaited_once()
         self.messages[0].delete.assert_not_awaited()
 

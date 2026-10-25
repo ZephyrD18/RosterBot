@@ -25,6 +25,7 @@ class RosterClient(discord.Client):
         await init_db()
         for raid in await fetch_all_raids():
             self.add_view(RaidSignupView(raid), message_id=raid["signup_message_id"])
+            restore_standby_offer_views(raid)
         await tree.sync()
         self.reminder_task = asyncio.create_task(reminder_loop(), name="raid-reminders")
 
@@ -113,17 +114,34 @@ ROLES = [
     ("H2", "Healer 2", "✨", discord.ButtonStyle.success, "Healer"),
     ("M1", "Melee 1", "⚔️", discord.ButtonStyle.danger, "DPS"),
     ("M2", "Melee 2", "⚔️", discord.ButtonStyle.danger, "DPS"),
-    ("R1", "Ranged 1", "🏹", discord.ButtonStyle.danger, "DPS"),
-    ("R2", "Ranged 2", "🏹", discord.ButtonStyle.danger, "DPS"),
+    ("R1", "Physical Ranged", "🏹", discord.ButtonStyle.danger, "DPS"),
+    ("R2", "Caster", "🔮", discord.ButtonStyle.danger, "DPS"),
 ]
 
 ROLE_LABELS = {key: label for key, label, _, _, _ in ROLES}
-ROSTER_GROUPS = [
-    ("MT", "OT"),
-    ("H1", "H2"),
-    ("M1", "M2"),
-    ("R1", "R2"),
+JOB_GROUPS = {
+    "Tank": ("Paladin", "Warrior", "Dark Knight", "Gunbreaker"),
+    "Healer": ("White Mage", "Scholar", "Astrologian", "Sage"),
+    "Melee": ("Monk", "Dragoon", "Ninja", "Samurai", "Reaper", "Viper"),
+    "Physical Ranged": ("Bard", "Machinist", "Dancer"),
+    "Caster": ("Black Mage", "Summoner", "Red Mage", "Pictomancer"),
+}
+ROLE_JOB_GROUPS = {
+    "MT": "Tank", "OT": "Tank", "H1": "Healer", "H2": "Healer",
+    "M1": "Melee", "M2": "Melee", "R1": "Physical Ranged", "R2": "Caster",
+}
+ALL_JOBS = frozenset(job for jobs in JOB_GROUPS.values() for job in jobs)
+DURATION_CHOICES = [
+    app_commands.Choice(name=label, value=minutes)
+    for label, minutes in (("1 hour", 60), ("90 minutes", 90), ("2 hours", 120),
+                           ("3 hours", 180), ("4 hours", 240), ("6 hours", 360))
 ]
+
+
+def compatible_jobs(role_key: str) -> tuple[str, ...]:
+    return JOB_GROUPS.get(ROLE_JOB_GROUPS.get(role_key), ())
+
+
 REMINDER_WINDOWS = [
     (24 * 60 * 60, "24 hours"),
     (12 * 60 * 60, "12 hours"),
@@ -181,11 +199,15 @@ def normalize_player(player: dict) -> dict:
     elif not isinstance(mention, str) or not mention:
         mention = display_name
     needs_mount = player.get("needs_mount")
+    job = player.get("job")
+    ready_status = player.get("ready_status")
     return {
         "user_id": user_id,
         "display_name": display_name,
         "mention": mention,
         "needs_mount": needs_mount if type(needs_mount) is bool else None,
+        "job": job if isinstance(job, str) and job in ALL_JOBS else None,
+        "ready_status": ready_status if ready_status in ("ready", "late", "unavailable") else None,
     }
 
 
@@ -203,6 +225,8 @@ def decode_signups(raw: str | None) -> dict:
                 "display_name": str(player),
                 "mention": str(player),
                 "needs_mount": None,
+                "job": None,
+                "ready_status": None,
             }
     return normalized
 
@@ -238,6 +262,8 @@ def player_from_user(user: discord.abc.User) -> dict:
         "display_name": user.display_name,
         "mention": user.mention,
         "needs_mount": None,
+        "job": None,
+        "ready_status": None,
     }
 
 
@@ -258,7 +284,10 @@ def roster_player_text(player: dict | None) -> str:
     if not player:
         return "OPEN"
 
-    return f"{player_text(player)} - {mount_text(player)}"
+    job = player.get("job") or "Job not chosen"
+    ready = READY_STATUSES.get(player.get("ready_status"))
+    text = f"{player_text(player)} · {job} · {mount_text(player)}"
+    return f"{text} · {ready}" if ready else text
 
 
 def user_is_signed_up(raid: dict, user_id: int) -> bool:
@@ -356,10 +385,8 @@ def raid_role_for_guild(guild: discord.Guild | None, raid: dict):
         return None
 
     role_id = raid.get("raid_role_id")
-    if role_id:
-        role = guild.get_role(int(role_id))
-        if role:
-            return role
+    if role_id is not None:
+        return guild.get_role(int(role_id))
 
     return find_role_by_name(guild, raid.get("raid_role_name") or DEFAULT_RAID_ROLE_NAME)
 
@@ -372,9 +399,7 @@ def get_raid_lock(signup_message_id: int) -> asyncio.Lock:
     return lock
 
 
-def allowed_mentions_for_raid(channel, raid: dict) -> discord.AllowedMentions:
-    guild = getattr(channel, "guild", None)
-    role = raid_role_for_guild(guild, raid)
+def allowed_mentions_for_raid(raid: dict) -> discord.AllowedMentions:
     users = []
     for player in raid["signups"].values():
         user_id = player.get("user_id")
@@ -383,7 +408,7 @@ def allowed_mentions_for_raid(channel, raid: dict) -> discord.AllowedMentions:
 
     return discord.AllowedMentions(
         everyone=False,
-        roles=[role] if role else False,
+        roles=False,
         users=users,
         replied_user=False,
     )
@@ -394,18 +419,19 @@ async def add_raid_role(member: discord.Member, raid: dict) -> str | None:
     if role is None:
         return f"I could not find a Discord role named `{raid.get('raid_role_name') or DEFAULT_RAID_ROLE_NAME}`."
 
-    warning = raid_role_safety_error(role)
-    if warning:
-        return warning
-
     async with get_role_lock(member.id, role.id):
+        warning = raid_role_safety_error(role)
+        if warning:
+            return warning
         try:
             # Atomic role endpoints are idempotent; cached member roles can be stale.
             await member.add_roles(role, reason=f"Signed up for {raid_title(raid)}")
         except discord.Forbidden:
-            return "I could not assign the raid role. Make sure I have Manage Roles and my bot role is above that role."
+            await save_role_update(member.guild.id, member.id, role.id, role.name, "add", f"Signed up for {raid_title(raid)}")
+            return "I could not assign the raid role. Make sure I have Manage Roles and my bot role is above that role. The update is saved and will retry."
         except discord.HTTPException:
-            return "Discord could not assign the raid role right now. Your signup was saved."
+            await save_role_update(member.guild.id, member.id, role.id, role.name, "add", f"Signed up for {raid_title(raid)}")
+            return "Discord could not assign the raid role right now. Your signup was saved. The role update will retry automatically."
 
     return None
 
@@ -416,27 +442,25 @@ async def remove_raid_role(member: discord.Member, raid: dict) -> str | None:
         return None
 
     async with get_role_lock(member.id, role.id):
-        for other_raid in await fetch_raids_for_role(role.id, role.name):
-            if other_raid["signup_message_id"] == raid["signup_message_id"]:
-                continue
-            if not user_is_signed_up(other_raid, member.id):
-                continue
-            if other_raid.get("raid_role_id") == role.id:
-                return None
-            channel = await fetch_raid_channel(other_raid)
-            if channel is None:
-                return "I kept the raid role because I could not verify another saved roster using that role."
-            if getattr(getattr(channel, "guild", None), "id", None) == member.guild.id:
-                other_role = raid_role_for_guild(member.guild, other_raid)
-                if other_role is not None and other_role.id == role.id:
-                    return None
+        warning = raid_role_safety_error(role)
+        if warning:
+            await save_role_update(member.guild.id, member.id, role.id, role.name, "remove", f"Left {raid_title(raid)}")
+            return f"I did not remove the raid role. {warning} A server manager must review it manually."
+        needed = await member_needs_raid_role(member.guild, member.id, role, excluding=raid["signup_message_id"])
+        if needed is True:
+            return None
+        if needed is None:
+            await save_role_update(member.guild.id, member.id, role.id, role.name, "remove", f"Left {raid_title(raid)}")
+            return "I kept the raid role because I could not verify another saved roster using that role. Cleanup is saved for retry."
 
         try:
             await member.remove_roles(role, reason=f"Left {raid_title(raid)}")
         except discord.Forbidden:
-            return "I could not remove the raid role. Make sure I have Manage Roles and my bot role is above that role."
+            await save_role_update(member.guild.id, member.id, role.id, role.name, "remove", f"Left {raid_title(raid)}")
+            return "I could not remove the raid role. Make sure I have Manage Roles and my bot role is above that role. Cleanup is saved and will retry."
         except discord.HTTPException:
-            return "Discord could not remove the raid role right now. A server manager may need to remove it manually."
+            await save_role_update(member.guild.id, member.id, role.id, role.name, "remove", f"Left {raid_title(raid)}")
+            return "Discord could not remove the raid role right now. Cleanup is saved and will retry automatically."
 
     return None
 
@@ -449,11 +473,157 @@ def get_role_lock(user_id: int, role_id: int) -> asyncio.Lock:
     return lock
 
 
+async def member_needs_raid_role(guild, user_id: int, role, *, excluding: int | None = None) -> bool | None:
+    for raid in await fetch_raids_for_role(role.id, role.name):
+        if raid["signup_message_id"] == excluding or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            continue
+        if not user_is_signed_up(raid, user_id):
+            continue
+        if raid.get("raid_role_id") == role.id:
+            return True
+        guild_id = raid.get("guild_id")
+        if guild_id is None:
+            channel = await fetch_raid_channel(raid)
+            if channel is None:
+                return None
+            guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if guild_id == guild.id:
+            other_role = raid_role_for_guild(guild, raid)
+            if other_role is not None and other_role.id == role.id:
+                return True
+    return False
+
+
+async def init_role_recovery_db(db):
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS role_retries (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role_id INTEGER NOT NULL,
+            role_name TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('add', 'remove')),
+            reason TEXT NOT NULL,
+            replacement_role_id INTEGER,
+            PRIMARY KEY (guild_id, user_id, role_id)
+        )
+        """
+    )
+
+
+async def save_role_update(guild_id: int, user_id: int, role_id: int, role_name: str, action: str, reason: str, *, replacement_role_id=None):
+    # Callers hold the member/role lock; one durable intent survives roster deletion.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO role_retries (guild_id, user_id, role_id, role_name, action, reason, replacement_role_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (guild_id, user_id, role_id) DO UPDATE SET
+                role_name = excluded.role_name, action = excluded.action, reason = excluded.reason,
+                replacement_role_id = excluded.replacement_role_id
+            """,
+            (guild_id, user_id, role_id, role_name, action, reason[:512], replacement_role_id),
+        )
+        await db.commit()
+
+
+async def queue_role_update(guild_id: int, user_id: int, role_id: int, role_name: str, action: str, reason: str, *, replacement_role_id=None):
+    async with get_role_lock(user_id, role_id):
+        await save_role_update(
+            guild_id, user_id, role_id, role_name, action, reason, replacement_role_id=replacement_role_id,
+        )
+
+
+async def queue_role_change(guild, user_id: int, role, old_role, raid: dict):
+    await queue_role_update(guild.id, user_id, role.id, role.name, "add", f"Signed up for {raid_title(raid)}")
+    if old_role is not None and old_role.id != role.id:
+        await queue_role_update(
+            guild.id, user_id, old_role.id, old_role.name, "remove", f"Left {raid_title(raid)}",
+            replacement_role_id=role.id,
+        )
+
+
+async def retry_pending_role_updates(guild_id: int | None = None) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM role_retries WHERE (? IS NULL OR guild_id = ?) ORDER BY action, role_id",
+            (guild_id, guild_id),
+        ) as cursor:
+            pending = [dict(row) for row in await cursor.fetchall()]
+    warnings = []
+    for update in pending:
+        try:
+            warning = await retry_role_update(update)
+            if warning and warning not in warnings:
+                warnings.append(warning)
+        except Exception:
+            logger.exception("Role retry failed for member %s role %s", update["user_id"], update["role_id"])
+            warning = "One or more role updates remain saved for another attempt."
+            if warning not in warnings:
+                warnings.append(warning)
+    return warnings
+
+
+async def retry_role_update(update: dict) -> str | None:
+    guild = bot.get_guild(update["guild_id"])
+    if guild is None:
+        return "Role updates remain saved because I cannot access the server."
+    async with get_role_lock(update["user_id"], update["role_id"]):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            key = (update["guild_id"], update["user_id"], update["role_id"])
+            async with db.execute(
+                "SELECT * FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
+            ) as cursor:
+                current = await cursor.fetchone()
+            if current is None:
+                return None
+            update = dict(current)
+            role = guild.get_role(update["role_id"])
+            if role is not None:
+                warning = raid_role_safety_error(role)
+                if warning:
+                    return f"A server manager must review a pending role update. {warning}"
+                needed = await member_needs_raid_role(guild, update["user_id"], role)
+                if needed is None:
+                    return "A role update is waiting until another saved roster can be verified."
+                replacement_id = update["replacement_role_id"]
+                if not needed and replacement_id:
+                    replacement = guild.get_role(replacement_id)
+                    replacement_needed = await member_needs_raid_role(guild, update["user_id"], replacement) if replacement else False
+                    if replacement_needed is None:
+                        return "Old role cleanup is waiting until the replacement roster can be verified."
+                    if replacement_needed:
+                        async with db.execute(
+                            "SELECT 1 FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?",
+                            (guild.id, update["user_id"], replacement_id),
+                        ) as cursor:
+                            if await cursor.fetchone():
+                                return "Old role cleanup is waiting for the replacement role assignment."
+                try:
+                    member = await fetch_guild_member(guild, update["user_id"])
+                    if member is not None:
+                        action = member.add_roles if needed else member.remove_roles
+                        await action(role, reason=update["reason"])
+                except discord.HTTPException:
+                    return "Discord could not complete a saved role update; it will retry automatically."
+            await db.execute(
+                "DELETE FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
+            )
+            await db.commit()
+    return None
+
+
 def raid_role_safety_error(role: discord.Role) -> str | None:
     if role.is_default() or role.managed:
         return "Choose a regular server role for raid signups."
     if role.permissions.value & UNSAFE_RAID_ROLE_PERMISSIONS.value:
         return "Raid signup roles cannot grant moderation, administration, or server management permissions."
+    for channel in getattr(role.guild, "channels", ()):
+        allowed, _ = channel.overwrites_for(role).pair()
+        if allowed.value & UNSAFE_RAID_ROLE_PERMISSIONS.value:
+            return "Raid signup roles cannot grant channel-specific moderation or management permissions."
     return None
 
 
@@ -480,7 +650,10 @@ async def remove_raid_role_from_player(
         member = await fetch_guild_member(guild, player.get("user_id"))
     except discord.HTTPException:
         logger.exception("Could not fetch guild member %s for raid role removal", player.get("user_id"))
-        return "I could not check a saved player's server membership, so their raid role may still need removal."
+        role = raid_role_for_guild(guild, raid)
+        if role is not None and player.get("user_id"):
+            await queue_role_update(guild.id, player["user_id"], role.id, role.name, "remove", f"Left {raid_title(raid)}")
+        return "I could not check a saved player's server membership, so their raid role may still need removal. Cleanup is saved and will retry."
     if member is None:
         return None
 
@@ -496,17 +669,22 @@ async def remove_all_raid_roles(guild: discord.Guild | None, raid: dict) -> list
     return warnings
 
 
-def reminder_ping_text(channel, raid: dict) -> str:
-    guild = getattr(channel, "guild", None)
-    role = raid_role_for_guild(guild, raid)
-    if role:
-        return role.mention
+async def queue_raid_role_cleanup(guild, raid: dict) -> list[str]:
+    if guild is None:
+        if raid.get("guild_id") and raid.get("raid_role_id"):
+            for player in raid["signups"].values():
+                if player.get("user_id"):
+                    await queue_role_update(
+                        raid["guild_id"], player["user_id"], raid["raid_role_id"],
+                        raid.get("raid_role_name") or DEFAULT_RAID_ROLE_NAME,
+                        "remove", f"Finished {raid_title(raid)}",
+                    )
+        return ["I could not access the server. Role cleanup remains saved for another attempt."] if raid["signups"] else []
+    return await remove_all_raid_roles(guild, raid)
 
-    return signed_player_mentions(raid["signups"])
 
-
-def five_minute_reminder_text(channel, raid: dict) -> str:
-    ping_text = reminder_ping_text(channel, raid)
+def five_minute_reminder_text(raid: dict) -> str:
+    ping_text = signed_player_mentions(raid["signups"])
     cheerful_message = random.choice(FIVE_MINUTE_MESSAGES)
     if raid.get("meeting_server"):
         meeting_text = f"We are gathering in **{raid['meeting_server']}**!"
@@ -558,7 +736,8 @@ RAID_COLUMNS = """
     signups, standby, scheduled_at, timezone, locked, group_name,
     reminders_sent, reminder_offset, raid_role_id, raid_role_name,
     announcement_message_id, setup_message, notify_role_id, notify_role_name,
-    meeting_server, cleanup_pending
+    meeting_server, cleanup_pending, guild_id, duration_minutes, finished_at,
+    ready_check_started_at, standby_offers, role_cleanup_pending
 """
 
 
@@ -591,7 +770,13 @@ async def init_db():
                 notify_role_id INTEGER,
                 notify_role_name TEXT,
                 meeting_server TEXT,
-                cleanup_pending INTEGER NOT NULL DEFAULT 0
+                cleanup_pending INTEGER NOT NULL DEFAULT 0,
+                guild_id INTEGER,
+                duration_minutes INTEGER NOT NULL DEFAULT 120,
+                finished_at INTEGER,
+                ready_check_started_at INTEGER,
+                standby_offers TEXT NOT NULL DEFAULT '{}',
+                role_cleanup_pending INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -622,6 +807,12 @@ async def init_db():
             ("notify_role_name", "TEXT"),
             ("meeting_server", "TEXT"),
             ("cleanup_pending", "INTEGER NOT NULL DEFAULT 0"),
+            ("guild_id", "INTEGER"),
+            ("duration_minutes", "INTEGER NOT NULL DEFAULT 120"),
+            ("finished_at", "INTEGER"),
+            ("ready_check_started_at", "INTEGER"),
+            ("standby_offers", "TEXT NOT NULL DEFAULT '{}'"),
+            ("role_cleanup_pending", "INTEGER NOT NULL DEFAULT 0"),
         )
         for column_name, column_type in migrations:
             if column_name not in columns:
@@ -636,6 +827,7 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS signups_cleanup ON signups(cleanup_pending) WHERE cleanup_pending = 1"
         )
+        await init_role_recovery_db(db)
         await db.commit()
 
 
@@ -647,8 +839,10 @@ def raid_from_row(row) -> dict | None:
     raid["signups"] = decode_signups(raid["signups"])
     raid["standby"] = decode_standby(raid["standby"])
     raid["reminders_sent"] = decode_reminders(raid["reminders_sent"])
+    raid["standby_offers"] = decode_standby_offers(raid["standby_offers"])
     raid["locked"] = bool(raid["locked"])
     raid["cleanup_pending"] = bool(raid["cleanup_pending"])
+    raid["role_cleanup_pending"] = bool(raid["role_cleanup_pending"])
     return raid
 
 
@@ -682,7 +876,7 @@ async def fetch_all_raids():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            f"SELECT {RAID_COLUMNS} FROM signups WHERE cleanup_pending = 0",
+            f"SELECT {RAID_COLUMNS} FROM signups WHERE cleanup_pending = 0 AND finished_at IS NULL",
         ) as cursor:
             return [raid_from_row(row) for row in await cursor.fetchall()]
 
@@ -693,7 +887,7 @@ async def fetch_raids_for_role(role_id: int, role_name: str):
         async with db.execute(
             f"""
             SELECT {RAID_COLUMNS} FROM signups
-            WHERE cleanup_pending = 0 AND (
+            WHERE cleanup_pending = 0 AND finished_at IS NULL AND (
                 raid_role_id = ? OR raid_role_name = ?
                 OR ((raid_role_name IS NULL OR raid_role_name = '') AND ? = ?)
             )
@@ -707,7 +901,8 @@ async def fetch_scheduled_raids(now: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            f"SELECT {RAID_COLUMNS} FROM signups WHERE cleanup_pending = 1 OR scheduled_at <= ?",
+            f"SELECT {RAID_COLUMNS} FROM signups WHERE cleanup_pending = 1 OR role_cleanup_pending = 1 OR "
+            "(finished_at IS NULL AND (scheduled_at <= ? OR standby_offers != '{}'))",
             (now + REMINDER_WINDOWS[0][0] + REMINDER_SELECTION_GRACE_SECONDS,),
         ) as cursor:
             return [raid_from_row(row) for row in await cursor.fetchall()]
@@ -721,7 +916,10 @@ async def save_raid_state(raid: dict):
             SET roster_message_id = ?, signups = ?, standby = ?, locked = ?,
                 group_name = ?, reminders_sent = ?, reminder_offset = ?,
                 raid_role_id = ?, raid_role_name = ?, announcement_message_id = ?,
-                setup_message = ?, notify_role_id = ?, notify_role_name = ?, meeting_server = ?
+                setup_message = ?, notify_role_id = ?, notify_role_name = ?, meeting_server = ?,
+                guild_id = COALESCE(?, guild_id), raid_name = ?, date = ?, time = ?,
+                scheduled_at = ?, duration_minutes = ?, finished_at = ?,
+                ready_check_started_at = ?, standby_offers = ?, role_cleanup_pending = ?
             WHERE signup_message_id = ? AND cleanup_pending = 0
             """,
             (
@@ -739,6 +937,16 @@ async def save_raid_state(raid: dict):
                 raid.get("notify_role_id"),
                 raid.get("notify_role_name"),
                 raid.get("meeting_server"),
+                raid.get("guild_id"),
+                raid["raid_name"],
+                raid["date"],
+                raid["time"],
+                raid.get("scheduled_at"),
+                raid.get("duration_minutes", 120),
+                raid.get("finished_at"),
+                raid.get("ready_check_started_at"),
+                encode_json(raid.get("standby_offers", {})),
+                int(raid.get("role_cleanup_pending", False)),
                 raid["signup_message_id"],
             ),
         )
@@ -756,9 +964,10 @@ async def insert_raid(raid: dict) -> None:
                 signups, standby, scheduled_at, timezone, locked,
                 group_name, reminders_sent, reminder_offset,
                 raid_role_id, raid_role_name, announcement_message_id, setup_message,
-                notify_role_id, notify_role_name, meeting_server
+                notify_role_id, notify_role_name, meeting_server, guild_id,
+                duration_minutes, finished_at, ready_check_started_at, standby_offers, role_cleanup_pending
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raid["signup_message_id"],
@@ -782,6 +991,12 @@ async def insert_raid(raid: dict) -> None:
                 raid["notify_role_id"],
                 raid["notify_role_name"],
                 raid["meeting_server"],
+                raid.get("guild_id"),
+                raid.get("duration_minutes", 120),
+                raid.get("finished_at"),
+                raid.get("ready_check_started_at"),
+                encode_json(raid.get("standby_offers", {})),
+                int(raid.get("role_cleanup_pending", False)),
             ),
         )
         await db.commit()
@@ -813,6 +1028,7 @@ async def delete_raid_row(signup_message_id: int):
 
 
 def stop_raid_views(signup_message_id: int):
+    stop_standby_offer_views(signup_message_id)
     for view in bot.persistent_views:
         if isinstance(view, RaidSignupView) and view.signup_message_id == signup_message_id:
             view.stop()
@@ -838,6 +1054,26 @@ async def finish_raid_cleanup(guild, raid: dict) -> tuple[bool, list[str]]:
         return False, [*warnings, "The posts were deleted. Role cleanup is saved and will retry automatically."]
     await delete_raid_row(raid["signup_message_id"])
     return True, []
+
+
+async def backfill_raid_guilds():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT signup_message_id, channel_id FROM signups WHERE guild_id IS NULL",
+        ) as cursor:
+            rows = await cursor.fetchall()
+        updates = []
+        for message_id, channel_id in rows:
+            channel = bot.get_channel(channel_id)
+            guild = getattr(channel, "guild", None)
+            if guild is not None:
+                updates.append((guild.id, message_id))
+        if updates:
+            await db.executemany(
+                "UPDATE signups SET guild_id = ? WHERE signup_message_id = ? AND guild_id IS NULL",
+                updates,
+            )
+            await db.commit()
 
 
 # --- Scheduling and input validation ---
@@ -960,6 +1196,8 @@ def parse_raid_datetime(date_text: str, time_text: str, timezone_name: str) -> i
 def schedule_text(raid: dict) -> str:
     meeting_text = f"\n**Meeting Server:** {raid['meeting_server']}" if raid.get("meeting_server") else ""
     if raid.get("scheduled_at"):
+        if raid.get("finished_at") is not None:
+            return f"**When:** <t:{raid['scheduled_at']}:F>\n**Finished:** <t:{raid['finished_at']}:F>{meeting_text}"
         return f"**When:** <t:{raid['scheduled_at']}:F>\n**Countdown:** <t:{raid['scheduled_at']}:R>{meeting_text}"
 
     return f"**Date:** {raid['date']}\n**Gather Time:** {raid['time']}{meeting_text}"
@@ -1013,39 +1251,27 @@ def clean_short_text(value: str | None, field_name: str, max_length: int) -> str
 
 # --- Roster rendering and posts ---
 
-def signup_embed(raid: dict) -> discord.Embed:
-    status = []
-    if raid["locked"]:
-        status.append("Roster locked")
-    if raid.get("reminder_offset"):
-        status.append(f"{reminder_label(raid['reminder_offset'])} reminder")
-    if raid.get("raid_role_name"):
-        status.append(f"{raid['raid_role_name']} active roster role")
-
-    status_text = f"\n**Status:** {', '.join(status)}" if status else ""
-    embed = discord.Embed(
-        title=f"⚔️ {raid_title(raid)}",
-        description=(
-            f"{schedule_text(raid)}{status_text}\n\n"
-            "Choose your light party role below."
-        ),
-        color=0x3E6AE1,
-    )
-    embed.set_footer(text=f"Signup message ID: {raid['signup_message_id']}")
-    return embed
+ROSTER_REFRESH_WARNING = "The changes were saved, but I could not update every raid post. Check my channel permissions."
 
 
 def roster_embed(raid: dict) -> discord.Embed:
     missing = missing_role_labels(raid["signups"])
+    finished = raid.get("finished_at") is not None
+    state = "Completed" if finished else "Locked" if raid["locked"] else "Recruiting" if missing else "Full party"
     summary = (
-        f"{schedule_text(raid)}\n"
-        f"**Standby:** {len(raid['standby'])}\n"
-        f"**Open:** {len(missing)}"
+        f"**{len(raid['signups'])}/8 signed up · {len(missing)} open · {len(raid['standby'])} standby**\n"
+        f"**{state}**\n\n{schedule_text(raid)}\n"
+        f"**Duration:** {raid.get('duration_minutes', 120)} minutes"
     )
+    if not finished:
+        summary += "\n\nChoose a role, pick your job, then answer the mount question."
+    if raid.get("ready_check_started_at"):
+        ready = sum(player.get("ready_status") == "ready" for player in raid["signups"].values())
+        summary += f"\n**Ready check:** {ready}/{len(raid['signups'])} ready"
     embed = discord.Embed(
-        title=f"📜 {raid_title(raid)} Roster",
+        title=f"⚔️ {raid_title(raid)}",
         description=summary,
-        color=0xD4AF37,
+        color=0xC8A34D if finished or not missing else 0x315DA8,
     )
 
     tank_lines = []
@@ -1062,32 +1288,24 @@ def roster_embed(raid: dict) -> discord.Embed:
         else:
             dps_lines.append(line)
 
-    embed.add_field(name="__**Tanks**__", value=fit_embed_lines(tank_lines, "OPEN"), inline=False)
-    embed.add_field(name="__**Healers**__", value=fit_embed_lines(healer_lines, "OPEN"), inline=False)
-    embed.add_field(name="__**DPS**__", value=fit_embed_lines(dps_lines, "OPEN"), inline=False)
-    open_slot_lines = []
-    for role_keys in ROSTER_GROUPS:
-        group_slots = []
-        for role_key in role_keys:
-            role_label = ROLE_LABELS[role_key]
-            group_slots.append(f"~~{role_label}~~" if role_key in raid["signups"] else role_label)
-        open_slot_lines.append(", ".join(group_slots))
-
-    embed.add_field(
-        name="__**Open Slots**__",
-        value="\n".join(open_slot_lines),
-        inline=False,
-    )
+    embed.add_field(name="Tanks", value=fit_embed_lines(tank_lines, "OPEN"), inline=False)
+    embed.add_field(name="Healers", value=fit_embed_lines(healer_lines, "OPEN"), inline=False)
+    embed.add_field(name="DPS", value=fit_embed_lines(dps_lines, "OPEN"), inline=False)
     standby_lines = [
-        f"{player_text(entry)} - {standby_role_text(entry['roles'])} - {mount_text(entry)}"
+        f"{roster_player_text(entry)} · {standby_role_text(entry['roles'])}"
         for entry in raid["standby"].values()
     ]
     embed.add_field(
-        name="__**Standby**__",
+        name="Standby",
         value=fit_embed_lines(standby_lines, "No standby players."),
         inline=False,
     )
-    embed.add_field(name="__**Mounts Needed**__", value=str(mount_needed_count(raid)), inline=False)
+    players = [*raid["signups"].values(), *raid["standby"].values()]
+    need = mount_needed_count(raid)
+    have = sum(player.get("needs_mount") is False for player in players)
+    unknown = len(players) - need - have
+    embed.add_field(name="Mount status", value=f"Need: {need} · Have: {have} · Unanswered: {unknown}", inline=False)
+    embed.set_footer(text=f"Signup message ID: {raid['signup_message_id']}")
     return embed
 
 
@@ -1101,12 +1319,12 @@ def roster_export_text(raid: dict) -> str:
     if raid["standby"]:
         lines.append("Standby:")
         for entry in raid["standby"].values():
-            lines.append(f"{player_text(entry)} - {standby_role_text(entry['roles'])} - {mount_text(entry)}")
+            lines.append(f"{roster_player_text(entry)} · {standby_role_text(entry['roles'])}")
     lines.append(f"Mounts Needed: {mount_needed_count(raid)}")
     return "\n".join(line for line in lines if line)
 
 
-async def update_raid_messages(channel, raid: dict):
+async def update_raid_messages(channel, raid: dict, *, raise_not_found: bool = False):
     if channel is None:
         return False
 
@@ -1115,8 +1333,12 @@ async def update_raid_messages(channel, raid: dict):
 
     try:
         signup_message = channel.get_partial_message(raid["signup_message_id"])
-        await signup_message.edit(embed=signup_embed(raid), view=view)
+        await signup_message.edit(embed=roster_embed(raid), view=view)
+        if raid.get("finished_at") is not None:
+            view.stop()
     except discord.NotFound:
+        if raise_not_found:
+            raise
         logger.warning("Signup message %s no longer exists", raid["signup_message_id"])
         updated = False
     except discord.HTTPException:
@@ -1124,33 +1346,134 @@ async def update_raid_messages(channel, raid: dict):
         updated = False
 
     roster_message_id = raid.get("roster_message_id")
-    if not roster_message_id:
+    if not roster_message_id or roster_message_id == raid["signup_message_id"]:
         return updated
 
     try:
         roster_message = channel.get_partial_message(roster_message_id)
-        await roster_message.edit(embed=roster_embed(raid))
+        if updated:
+            await roster_message.delete()
+        else:
+            await roster_message.edit(embed=roster_embed(raid))
     except discord.NotFound:
-        logger.warning("Roster message %s no longer exists", roster_message_id)
-        updated = False
+        pass
     except discord.HTTPException:
-        logger.exception("Could not update roster message %s", roster_message_id)
-        updated = False
+        logger.exception("Could not consolidate old roster message %s", roster_message_id)
+        return False
+
+    if updated:
+        raid["roster_message_id"] = None
+        await save_raid_state(raid)
 
     return updated
 
 
-async def fetch_raid_channel(raid: dict):
+async def repair_raid_announcement(channel, raid: dict) -> list[str]:
+    announcement_id = raid.get("announcement_message_id")
+    if not announcement_id:
+        return []
+    guild_id = raid.get("guild_id") or getattr(getattr(channel, "guild", None), "id", None)
+    if not guild_id:
+        return ["I could not identify the server to update the announcement link."]
+    prefix = f"<@&{raid['notify_role_id']}> " if raid.get("notify_role_id") else ""
+    text = raid.get("setup_message") or default_setup_message(raid["raid_name"])
+    jump_url = f"https://discord.com/channels/{guild_id}/{raid['channel_id']}/{raid['signup_message_id']}"
+    content = f"{prefix}{text}\n\nRole signup: {jump_url}"
+    try:
+        await channel.get_partial_message(announcement_id).edit(
+            content=content, allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.NotFound:
+        try:
+            message = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            logger.exception("Could not recreate announcement for %s", raid["signup_message_id"])
+            return ["The roster is saved, but I could not recreate its missing announcement."]
+        raid["announcement_message_id"] = message.id
+        try:
+            await save_raid_state(raid)
+        except (aiosqlite.Error, ValueError):
+            raid["announcement_message_id"] = announcement_id
+            await delete_created_messages([message], "announcement repair save failure")
+            logger.exception("Could not save repaired announcement for %s", raid["signup_message_id"])
+            return ["The roster is saved, but I could not save its replacement announcement."]
+    except discord.HTTPException:
+        logger.exception("Could not update announcement for %s", raid["signup_message_id"])
+        return ["The roster is saved, but I could not update its announcement link."]
+    return []
+
+
+async def repair_raid_messages(channel, raid: dict, *, repost: bool = False) -> list[str]:
+    if not repost:
+        try:
+            refreshed = await update_raid_messages(channel, raid, raise_not_found=True)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            return ["I could not repair the roster post. Check my channel permissions."]
+        else:
+            warnings = [] if refreshed else [ROSTER_REFRESH_WARNING]
+            warnings.extend(await repair_raid_announcement(channel, raid))
+            return warnings
+
+    old_id = raid["signup_message_id"]
+    message = await channel.send(embed=roster_embed(raid))
+    try:
+        await cancel_standby_offers(channel, raid)
+    except (aiosqlite.Error, ValueError):
+        await delete_created_messages([message], "roster repair cancellation failure")
+        raise
+    async with get_raid_lock(message.id):
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "UPDATE signups SET signup_message_id = ? WHERE signup_message_id = ? AND cleanup_pending = 0",
+                    (message.id, old_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("This roster was deleted or is awaiting cleanup.")
+                await db.commit()
+        except (aiosqlite.Error, ValueError):
+            await delete_created_messages([message], "roster repair save failure")
+            raise
+        stop_raid_views(old_id)
+        raid["signup_message_id"] = message.id
+        warnings = [] if await update_raid_messages(channel, raid) else [ROSTER_REFRESH_WARNING]
+        warnings.extend(await repair_raid_announcement(channel, raid))
+        if repost:
+            try:
+                await channel.get_partial_message(old_id).delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                warnings.append("The new roster is saved, but I could not delete the old post.")
+    return warnings
+
+
+async def fetch_raid_channel(raid: dict, *, raise_not_found: bool = False):
     if not raid.get("channel_id"):
         return None
     channel = bot.get_channel(raid["channel_id"])
-    if channel is not None:
-        return channel
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(raid["channel_id"])
+        except discord.NotFound:
+            if raise_not_found:
+                raise
+            return None
+        except discord.HTTPException:
+            return None
 
-    try:
-        return await bot.fetch_channel(raid["channel_id"])
-    except discord.HTTPException:
-        return None
+    guild = getattr(channel, "guild", None)
+    if guild is not None and not raid.get("guild_id"):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE signups SET guild_id = ? WHERE signup_message_id = ? AND guild_id IS NULL",
+                (guild.id, raid["signup_message_id"]),
+            )
+            await db.commit()
+        raid["guild_id"] = guild.id
+    return channel
 
 
 async def delete_raid_messages(channel, raid: dict):
@@ -1230,6 +1553,7 @@ async def delete_raid_for_command(interaction: discord.Interaction, raid: dict) 
             return False, ["That roster was already deleted."]
 
         if not current_raid.get("cleanup_pending"):
+            await cancel_standby_offers(interaction.channel, current_raid)
             if not await delete_raid_messages(interaction.channel, current_raid):
                 return False, ["I could not delete every bot post, so the saved roster was kept for another attempt."]
             await mark_raid_cleanup_pending(current_raid)
@@ -1247,15 +1571,32 @@ async def create_raid(
     notify_role: discord.Role | None = None,
     send_announcement: bool = False,
     meeting_server: str | None = None,
+    duration_minutes: int = 180,
 ):
     if interaction.channel is None or interaction.guild is None:
         await interaction.followup.send("This command needs to be used in a server channel.", ephemeral=True)
         return
 
+    announcement_role = None
+    if send_announcement:
+        announcement_role = notify_role or find_role_by_name(interaction.guild, DEFAULT_NOTIFY_ROLE_NAME)
+        if announcement_role is not None:
+            if announcement_role.is_default():
+                await interaction.followup.send("Choose a notification role other than @everyone.", ephemeral=True)
+                return
+            if not announcement_role.mentionable and not interaction.permissions.mention_everyone:
+                await interaction.followup.send(
+                    "That notification role is not mentionable. Choose a mentionable role or ask a manager with Mention Everyone permission.",
+                    ephemeral=True,
+                )
+                return
+
     try:
         raid_name = clean_short_text(raid_name, "Raid name", 100)
         group_name = clean_short_text(group_name, "Group name", 50)
         meeting_server = clean_short_text(meeting_server, "Meeting server", 100)
+        if type(duration_minutes) is not int or not 30 <= duration_minutes <= 720:
+            raise ValueError("Choose a raid duration between 30 and 720 minutes.")
         if raid_name is None:
             raise ValueError("Raid name cannot be blank.")
         scheduled_at = parse_raid_datetime(date, time, DEFAULT_TIMEZONE_NAME)
@@ -1267,8 +1608,9 @@ async def create_raid(
 
     raid = {
         "signup_message_id": 0,
-        "roster_message_id": 0,
+        "roster_message_id": None,
         "channel_id": interaction.channel_id,
+        "guild_id": interaction.guild.id,
         "raid_name": raid_name,
         "date": date,
         "time": time,
@@ -1287,6 +1629,10 @@ async def create_raid(
         "notify_role_id": notify_role.id if notify_role else None,
         "notify_role_name": notify_role.name if notify_role else None,
         "meeting_server": meeting_server,
+        "duration_minutes": duration_minutes,
+        "finished_at": None,
+        "ready_check_started_at": None,
+        "standby_offers": {},
     }
 
     existing_role = find_role_by_name(interaction.guild, DEFAULT_RAID_ROLE_NAME)
@@ -1295,7 +1641,7 @@ async def create_raid(
 
     setup_warnings = []
     try:
-        signup_message = await interaction.channel.send(embed=signup_embed(raid))
+        signup_message = await interaction.channel.send(embed=roster_embed(raid))
         raid["signup_message_id"] = signup_message.id
     except discord.HTTPException as exc:
         logger.error(
@@ -1323,7 +1669,6 @@ async def create_raid(
             return
 
         if send_announcement:
-            announcement_role = notify_role or find_role_by_name(interaction.guild, DEFAULT_NOTIFY_ROLE_NAME)
             announcement_text = raid.get("setup_message") or default_setup_message(raid["raid_name"])
             announcement_prefix = ""
             allowed_mentions = discord.AllowedMentions.none()
@@ -1366,39 +1711,78 @@ async def create_raid(
                 setup_warnings.append("The signup was saved, but I could not save the announcement message.")
 
         try:
-            roster_message = await interaction.channel.send(embed=roster_embed(raid))
-            raid["roster_message_id"] = roster_message.id
-            await save_raid_state(raid)
-        except discord.HTTPException as exc:
-            logger.error(
-                "Could not create roster message for %s",
-                raid["signup_message_id"],
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            setup_warnings.append("The signup was saved, but I could not create the roster message.")
-        except aiosqlite.Error as exc:
-            await delete_created_messages([roster_message], "roster database update failed")
-            raid["roster_message_id"] = 0
-            logger.error(
-                "Could not save roster message for %s",
-                raid["signup_message_id"],
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            setup_warnings.append("The signup was saved, but I could not save the roster message.")
-
-        try:
-            await signup_message.edit(embed=signup_embed(raid), view=RaidSignupView(raid))
+            await signup_message.edit(embed=roster_embed(raid), view=RaidSignupView(raid))
         except discord.HTTPException:
             logger.exception("Could not activate signup buttons for %s", raid["signup_message_id"])
             setup_warnings.append("I created the signup but could not activate its buttons.")
 
-    response = f"Raid signup created. Signup message ID: `{raid['signup_message_id']}`"
+    response = f"Raid signup created. It finishes automatically after {duration_minutes} minutes and keeps the completed roster. Signup message ID: `{raid['signup_message_id']}`"
     if setup_warnings:
         response += "\n" + "\n".join(f"- {warning}" for warning in setup_warnings)
     await interaction.followup.send(response, ephemeral=True)
 
 
 # --- Signup interactions ---
+
+class JobChoiceView(ErrorHandledView):
+    def __init__(self, signup_message_id: int, user_id: int, role_key: str | None, roles: list[str] | None = None):
+        super().__init__(timeout=300)
+        self.signup_message_id = signup_message_id
+        self.user_id = user_id
+        self.role_key = role_key
+        if role_key is not None:
+            self.jobs = compatible_jobs(role_key)
+        else:
+            self.jobs = tuple(job for group, jobs in JOB_GROUPS.items() for job in jobs
+                              if (group if group in ("Tank", "Healer") else "DPS") in (roles or []))
+        self.menu = discord.ui.Select(
+            placeholder="Which job will you play?", min_values=1, max_values=1,
+            options=[discord.SelectOption(label=job, value=job) for job in self.jobs],
+            custom_id=f"job:{signup_message_id}:{user_id}:{role_key or 'standby'}",
+        )
+        self.menu.callback = self.choose_callback
+        self.add_item(self.menu)
+
+    async def choose_callback(self, interaction: discord.Interaction):
+        await self.set_job(interaction, self.menu.values[0])
+
+    async def set_job(self, interaction: discord.Interaction, job: str):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This job picker is not yours.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        async with get_raid_lock(self.signup_message_id):
+            raid = await fetch_signup(self.signup_message_id)
+            if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+                await interaction.followup.send("This raid is no longer accepting job changes.", ephemeral=True)
+                return
+            if self.is_finished():
+                await interaction.followup.send("This job picker is closed. Use the Job button to reopen it.", ephemeral=True)
+                return
+            if self.role_key is None:
+                player = raid["standby"].get(str(self.user_id))
+                valid_jobs = {candidate for key, _, _, _, group in ROLES
+                              if player and group in player["roles"] for candidate in compatible_jobs(key)}
+            else:
+                player = raid["signups"].get(self.role_key)
+                valid_jobs = set(compatible_jobs(self.role_key))
+            if not player or player.get("user_id") != self.user_id:
+                await interaction.followup.send("Your signup changed. Use the Job button to choose again.", ephemeral=True)
+                return
+            if job not in self.jobs or job not in valid_jobs:
+                await interaction.followup.send("That job does not fit your selected role.", ephemeral=True)
+                return
+            player["job"] = job
+            await save_raid_state(raid)
+            refreshed = await update_raid_messages(interaction.channel, raid)
+            self.stop()
+        message = f"Job saved: **{job}**. Do you still need the mount?"
+        if not refreshed:
+            message += f"\n{ROSTER_REFRESH_WARNING}"
+        await interaction.edit_original_response(
+            content=message, view=MountNeedView(self.signup_message_id, self.user_id),
+        )
+
 
 class MountNeedView(ErrorHandledView):
     def __init__(self, signup_message_id: int, user_id: int):
@@ -1435,8 +1819,8 @@ class MountNeedView(ErrorHandledView):
                 await interaction.followup.send("I could not find this raid signup anymore.", ephemeral=True)
                 return
 
-            if raid.get("cleanup_pending"):
-                await interaction.followup.send("This raid is being deleted; role cleanup is pending.", ephemeral=True)
+            if raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+                await interaction.followup.send("This raid is completed or awaiting cleanup.", ephemeral=True)
                 return
 
             updated = False
@@ -1456,9 +1840,12 @@ class MountNeedView(ErrorHandledView):
                 return
 
             await save_raid_state(raid)
-            await update_raid_messages(interaction.channel, raid)
+            refreshed = await update_raid_messages(interaction.channel, raid)
         result = "Needs Mount" if needs_mount else "Doesn't Need Mount"
-        await interaction.edit_original_response(content=f"Mount status saved: **{result}**.", view=None)
+        message = f"Mount status saved: **{result}**."
+        if not refreshed:
+            message += f"\n{ROSTER_REFRESH_WARNING}"
+        await interaction.edit_original_response(content=message, view=None)
 
 
 def standby_panel_text(raid: dict, roles: list[str]) -> str:
@@ -1484,7 +1871,7 @@ class StandbyRoleView(ErrorHandledView):
         for role_name in STANDBY_CHOICES:
             button = discord.ui.Button(
                 label=role_name,
-                style=discord.ButtonStyle.secondary,
+                style=discord.ButtonStyle.primary if role_name in self.roles else discord.ButtonStyle.secondary,
                 custom_id=f"standby:{self.signup_message_id}:{self.user_id}:{role_name}",
                 row=0,
             )
@@ -1504,7 +1891,7 @@ class StandbyRoleView(ErrorHandledView):
 
     def add_clear_button(self):
         button = discord.ui.Button(
-            label="Clear Standby",
+            label="Clear selections",
             emoji="🧹",
             style=discord.ButtonStyle.danger,
             custom_id=f"standby:{self.signup_message_id}:{self.user_id}:clear",
@@ -1526,6 +1913,8 @@ class StandbyRoleView(ErrorHandledView):
         raid = await fetch_signup(self.signup_message_id)
         if not raid:
             await interaction.followup.send("I could not find this raid signup anymore.", ephemeral=True)
+        elif raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            await interaction.followup.send("This raid is closed.", ephemeral=True)
         elif raid["locked"]:
             await interaction.followup.send("This roster is locked.", ephemeral=True)
         elif user_is_signed_up(raid, interaction.user.id):
@@ -1548,6 +1937,7 @@ class StandbyRoleView(ErrorHandledView):
                 self.roles.remove(role_name)
             else:
                 self.roles.append(role_name)
+            self.update_selection_styles()
             await interaction.edit_original_response(content=standby_panel_text(raid, self.roles), view=self)
 
     async def confirm_callback(self, interaction: discord.Interaction):
@@ -1568,20 +1958,33 @@ class StandbyRoleView(ErrorHandledView):
                 entry = player_from_user(interaction.user) | {
                     "roles": self.roles.copy(),
                     "needs_mount": saved_entry.get("needs_mount") if saved_entry else None,
+                    "job": saved_entry.get("job") if saved_entry else None,
+                    "ready_status": saved_entry.get("ready_status") if saved_entry else None,
                 }
+                jobs = {job for key, _, _, _, group in ROLES if group in self.roles for job in compatible_jobs(key)}
+                if entry["job"] not in jobs:
+                    entry["job"] = None
                 raid["standby"][user_key] = entry
                 await save_raid_state(raid)
             elif remove_user_from_standby(raid["standby"], interaction.user.id):
                 await save_raid_state(raid)
+            refreshed = True
             if entry or saved_entry:
-                await update_raid_messages(interaction.channel, raid)
+                refreshed = await update_raid_messages(interaction.channel, raid)
+                await process_standby_offers(interaction.channel, raid)
             self.stop()
 
-        await interaction.edit_original_response(
-            content=f"Standby roles confirmed: **{standby_role_text(entry['roles'])}**." if entry else "Standby cleared.",
-            view=None,
-        )
-        if entry and entry.get("needs_mount") is None:
+        message = f"Standby roles confirmed: **{standby_role_text(entry['roles'])}**." if entry else "Standby cleared."
+        if not refreshed:
+            message += f"\n{ROSTER_REFRESH_WARNING}"
+        await interaction.edit_original_response(content=message, view=None)
+        if entry and not entry.get("job"):
+            await interaction.followup.send(
+                "What job will you play?",
+                view=JobChoiceView(self.signup_message_id, interaction.user.id, None, entry["roles"]),
+                ephemeral=True,
+            )
+        elif entry and entry.get("needs_mount") is None:
             await interaction.followup.send(
                 "Do you still need the mount?",
                 view=MountNeedView(self.signup_message_id, interaction.user.id),
@@ -1599,7 +2002,245 @@ class StandbyRoleView(ErrorHandledView):
             if not raid:
                 return
             self.roles.clear()
+            self.update_selection_styles()
             await interaction.edit_original_response(content=standby_panel_text(raid, self.roles), view=self)
+
+
+    def update_selection_styles(self):
+        for button in self.children:
+            if button.label in STANDBY_CHOICES:
+                button.style = discord.ButtonStyle.primary if button.label in self.roles else discord.ButtonStyle.secondary
+
+
+# --- Standby offers ---
+
+STANDBY_OFFER_SECONDS = 5 * 60
+
+
+def decode_standby_offers(raw: str | None) -> dict:
+    offers = {}
+    for role_key, offer in decode_json(raw, {}).items():
+        if role_key not in ROLE_LABELS or not isinstance(offer, dict):
+            continue
+        token = offer.get("token")
+        user_id, message_id, expires_at = (offer.get(key) for key in ("user_id", "message_id", "expires_at"))
+        if not isinstance(token, str) or len(token) != 8 or any(char not in "0123456789abcdef" for char in token):
+            continue
+        if user_id is not None and (type(user_id) is not int or not 0 < user_id < 2**64):
+            continue
+        if message_id is not None and (type(message_id) is not int or not 0 < message_id < 2**63):
+            continue
+        if user_id is not None and (type(expires_at) is not int or expires_at <= 0):
+            continue
+        tried = offer.get("tried_user_ids", [])
+        if not isinstance(tried, list):
+            tried = []
+        offers[role_key] = {
+            "user_id": user_id, "message_id": message_id if user_id else None,
+            "expires_at": expires_at if user_id else None, "token": token,
+            "tried_user_ids": list(dict.fromkeys(value for value in tried if type(value) is int and 0 < value < 2**64)),
+        }
+    return offers
+
+
+def standby_offer_eligible(raid: dict, role_key: str, user_id: int) -> bool:
+    entry = raid["standby"].get(str(user_id))
+    category = next((category for key, _, _, _, category in ROLES if key == role_key), None)
+    return bool(entry and category in entry["roles"] and not user_is_signed_up(raid, user_id))
+
+
+def standby_work_due(raid: dict, now: int) -> bool:
+    offers = raid.get("standby_offers", {})
+    if offers and (raid["locked"] or raid.get("finished_at") is not None):
+        return True
+    return any(
+        key in raid["signups"]
+        or (offer.get("user_id") and (
+            not offer.get("message_id")
+            or (offer.get("expires_at") or 0) <= now
+            or not standby_offer_eligible(raid, key, offer["user_id"])
+        ))
+        for key, offer in offers.items()
+    )
+
+
+def stop_standby_offer_views(signup_message_id: int, role_key: str | None = None):
+    for view in bot.persistent_views:
+        if isinstance(view, StandbyOfferView) and view.signup_message_id == signup_message_id:
+            if role_key is None or view.role_key == role_key:
+                view.stop()
+
+
+async def close_standby_offer(channel, signup_message_id: int, role_key: str, message_id: int | None):
+    stop_standby_offer_views(signup_message_id, role_key)
+    if channel is not None and message_id:
+        try:
+            await channel.get_partial_message(message_id).edit(content="Standby offer closed.", view=None)
+        except discord.HTTPException:
+            logger.warning("Could not close standby offer message %s", message_id)
+
+
+async def cancel_standby_offers(channel, raid: dict):
+    if not raid.get("standby_offers"):
+        return
+    offers = raid["standby_offers"]
+    raid["standby_offers"] = {}
+    await save_raid_state(raid)
+    for role_key, offer in offers.items():
+        await close_standby_offer(channel, raid["signup_message_id"], role_key, offer.get("message_id"))
+
+
+async def offer_standby_for_open_slots(channel, raid: dict):
+    if channel is None or raid["locked"] or raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+        return
+    offers = raid.setdefault("standby_offers", {})
+    offered_users = {offer["user_id"] for offer in offers.values() if offer.get("user_id")}
+    for role_key, role_label, _, _, _ in ROLES:
+        if role_key in raid["signups"]:
+            continue
+        offer = offers.get(role_key)
+        if offer and offer.get("user_id") and offer.get("message_id"):
+            continue
+        if not offer or not offer.get("user_id"):
+            tried = offer.get("tried_user_ids", []) if offer else []
+            user_id = next((
+                int(user_key) for user_key in raid["standby"]
+                if int(user_key) not in offered_users and int(user_key) not in tried
+                and standby_offer_eligible(raid, role_key, int(user_key))
+            ), None)
+            if user_id is None:
+                continue
+            offer = {
+                "user_id": user_id, "expires_at": None, "message_id": None,
+                "tried_user_ids": [*tried, user_id], "token": os.urandom(4).hex(),
+            }
+            offers[role_key] = offer
+            offered_users.add(user_id)
+        offer["expires_at"] = int(datetime.now(timezone.utc).timestamp()) + STANDBY_OFFER_SECONDS
+        await save_raid_state(raid)
+        view = StandbyOfferView(raid["signup_message_id"], role_key, offer["user_id"], offer["token"])
+        try:
+            message = await channel.send(
+                f"<@{offer['user_id']}>, **{role_label}** is open for **{raid_title(raid)}**. "
+                f"This offer expires <t:{offer['expires_at']}:R>. Accept to join, or decline to stay on standby.",
+                view=view,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=offer["user_id"])], replied_user=False),
+            )
+        except discord.HTTPException:
+            view.stop()
+            logger.exception("Could not send standby offer for %s/%s", raid["signup_message_id"], role_key)
+            continue
+        offer["message_id"] = message.id
+        try:
+            await save_raid_state(raid)
+        except (aiosqlite.Error, ValueError):
+            view.stop()
+            await delete_created_messages([message], "standby offer save failed")
+            raise
+
+
+async def process_standby_offers(channel, raid: dict):
+    if raid["locked"] or raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+        await cancel_standby_offers(channel, raid)
+        return
+    offers = raid.setdefault("standby_offers", {})
+    now = int(datetime.now(timezone.utc).timestamp())
+    closed_offers = []
+    for role_key, offer in list(offers.items()):
+        if role_key in raid["signups"]:
+            closed_offers.append((role_key, offer.get("message_id")))
+            del offers[role_key]
+        elif offer.get("user_id") and (
+            not standby_offer_eligible(raid, role_key, offer["user_id"])
+            or (offer.get("message_id") and offer["expires_at"] <= now)
+        ):
+            closed_offers.append((role_key, offer.get("message_id")))
+            offer.update(user_id=None, expires_at=None, message_id=None)
+    if closed_offers:
+        await save_raid_state(raid)
+        for role_key, message_id in closed_offers:
+            await close_standby_offer(channel, raid["signup_message_id"], role_key, message_id)
+    await offer_standby_for_open_slots(channel, raid)
+
+
+def restore_standby_offer_views(raid: dict):
+    if raid["locked"] or raid.get("finished_at") is not None:
+        return
+    for role_key, offer in raid.get("standby_offers", {}).items():
+        if offer.get("user_id") and offer.get("message_id"):
+            bot.add_view(
+                StandbyOfferView(raid["signup_message_id"], role_key, offer["user_id"], offer["token"]),
+                message_id=offer["message_id"],
+            )
+
+
+class StandbyOfferView(ErrorHandledView):
+    def __init__(self, signup_message_id: int, role_key: str, user_id: int, token: str):
+        super().__init__(timeout=None)
+        self.signup_message_id = signup_message_id
+        self.role_key = role_key
+        self.user_id = user_id
+        self.token = token
+        for accept, label in ((True, "Accept slot"), (False, "Decline")):
+            button = discord.ui.Button(
+                label=label, style=discord.ButtonStyle.success if accept else discord.ButtonStyle.secondary,
+                custom_id=f"standby_offer:{signup_message_id}:{role_key}:{user_id}:{token}:{int(accept)}",
+            )
+            button.callback = self.create_callback(accept)
+            self.add_item(button)
+
+    def create_callback(self, accept: bool):
+        async def callback(interaction: discord.Interaction):
+            await self.respond(interaction, accept)
+        return callback
+
+    async def respond(self, interaction: discord.Interaction, accept: bool):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This standby offer is for another player.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with get_raid_lock(self.signup_message_id):
+            raid = await fetch_signup(self.signup_message_id)
+            offer = raid.get("standby_offers", {}).get(self.role_key) if raid else None
+            now = int(datetime.now(timezone.utc).timestamp())
+            if (
+                not raid or raid["locked"] or raid.get("finished_at") is not None or raid.get("cleanup_pending")
+                or not offer or offer.get("token") != self.token or offer.get("user_id") != self.user_id
+                or not offer.get("message_id") or offer["expires_at"] <= now
+                or self.role_key in raid["signups"] or not standby_offer_eligible(raid, self.role_key, self.user_id)
+            ):
+                await interaction.followup.send("This standby offer is no longer available.", ephemeral=True)
+                return
+            message_id = offer["message_id"]
+            if not accept:
+                offer.update(user_id=None, expires_at=None, message_id=None)
+                await save_raid_state(raid)
+                await close_standby_offer(interaction.channel, self.signup_message_id, self.role_key, message_id)
+                await process_standby_offers(interaction.channel, raid)
+                await interaction.followup.send("Offer declined. You are still on standby.", ephemeral=True)
+                return
+            player = raid["standby"].pop(str(self.user_id))
+            player.pop("roles", None)
+            if player.get("job") not in compatible_jobs(self.role_key):
+                player["job"] = None
+            player["ready_status"] = None
+            raid["signups"][self.role_key] = player
+            del raid["standby_offers"][self.role_key]
+            await save_raid_state(raid)
+            await close_standby_offer(interaction.channel, self.signup_message_id, self.role_key, message_id)
+            warning = await add_raid_role(interaction.user, raid) if isinstance(interaction.user, discord.Member) else None
+            refreshed = await update_raid_messages(interaction.channel, raid)
+            await process_standby_offers(interaction.channel, raid)
+            message = f"You accepted **{ROLE_LABELS[self.role_key]}**."
+            if warning:
+                message += f"\n{warning}"
+            if not refreshed:
+                message += f"\n{ROSTER_REFRESH_WARNING}"
+        await interaction.followup.send(message, ephemeral=True)
+        if not player.get("job"):
+            await interaction.followup.send("What job will you play?", view=JobChoiceView(self.signup_message_id, self.user_id, self.role_key), ephemeral=True)
+        elif player.get("needs_mount") is None:
+            await interaction.followup.send("Do you still need the mount?", view=MountNeedView(self.signup_message_id, self.user_id), ephemeral=True)
 
 
 class RaidSignupView(ErrorHandledView):
@@ -1610,6 +2251,11 @@ class RaidSignupView(ErrorHandledView):
         self.add_standby_button(raid)
         self.add_resign_button(raid)
         self.add_mount_button()
+        self.add_job_button()
+        self.add_ready_button(raid)
+        if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            for item in self.children:
+                item.disabled = True
 
     def add_role_buttons(self, raid: dict):
         for index, (role_key, role_label, role_emoji, style, _) in enumerate(ROLES):
@@ -1638,7 +2284,7 @@ class RaidSignupView(ErrorHandledView):
 
     def add_resign_button(self, raid: dict):
         button = discord.ui.Button(
-            label="Resign",
+            label="Leave roster",
             emoji="🚪",
             style=discord.ButtonStyle.secondary,
             custom_id=f"raid_signup:{self.signup_message_id}:resign",
@@ -1658,6 +2304,55 @@ class RaidSignupView(ErrorHandledView):
         button.callback = self.mount_callback
         self.add_item(button)
 
+    def add_job_button(self):
+        button = discord.ui.Button(
+            label="Job", style=discord.ButtonStyle.secondary,
+            custom_id=f"raid_signup:{self.signup_message_id}:job", row=4,
+        )
+        button.callback = self.job_callback
+        self.add_item(button)
+
+    async def job_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raid = await fetch_signup(self.signup_message_id)
+        if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            await interaction.followup.send("This raid is completed or unavailable.", ephemeral=True)
+            return
+        role_key = next((key for key, player in raid["signups"].items()
+                         if player.get("user_id") == interaction.user.id), None)
+        standby = raid["standby"].get(str(interaction.user.id))
+        if role_key is None and not standby:
+            await interaction.followup.send("Choose a roster role or confirm standby first.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "Which job will you play?",
+            view=JobChoiceView(self.signup_message_id, interaction.user.id, role_key,
+                               standby["roles"] if standby else None), ephemeral=True,
+        )
+
+    def add_ready_button(self, raid: dict):
+        button = discord.ui.Button(
+            label="Ready check", style=discord.ButtonStyle.secondary,
+            custom_id=f"raid_signup:{self.signup_message_id}:ready", row=4,
+            disabled=not raid.get("ready_check_started_at"),
+        )
+        button.callback = self.ready_callback
+        self.add_item(button)
+
+    async def ready_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raid = await fetch_signup(self.signup_message_id)
+        if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            await interaction.followup.send("This raid is completed or unavailable.", ephemeral=True)
+            return
+        if not raid.get("ready_check_started_at") or not user_is_signed_up(raid, interaction.user.id):
+            await interaction.followup.send("Ready checks are available to signed players after a leader starts one.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "Will you be ready for the raid?", ephemeral=True,
+            view=ReadyCheckView(self.signup_message_id, raid["ready_check_started_at"]),
+        )
+
     async def mount_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         raid = await fetch_signup(self.signup_message_id)
@@ -1665,8 +2360,8 @@ class RaidSignupView(ErrorHandledView):
             await interaction.followup.send("I could not find this raid signup anymore.", ephemeral=True)
             return
 
-        if raid.get("cleanup_pending"):
-            await interaction.followup.send("This raid is being deleted; role cleanup is pending.", ephemeral=True)
+        if raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            await interaction.followup.send("This raid is completed or awaiting cleanup.", ephemeral=True)
             return
 
         if not user_is_signed_up(raid, interaction.user.id) and str(interaction.user.id) not in raid["standby"]:
@@ -1698,6 +2393,10 @@ class RaidSignupView(ErrorHandledView):
                 await interaction.followup.send("This roster is locked.", ephemeral=True)
                 return
 
+            if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+                await interaction.followup.send("This raid is completed or awaiting cleanup.", ephemeral=True)
+                return
+
             if role_key in raid["signups"]:
                 await interaction.followup.send(
                     f"**{role_label}** is already taken. Use the **Standby** button if you can flex.",
@@ -1708,26 +2407,34 @@ class RaidSignupView(ErrorHandledView):
             user_id = interaction.user.id
             previous_role_key = None
             needs_mount = None
+            job = None
             for existing_role_key, player in list(raid["signups"].items()):
                 if player.get("user_id") == user_id:
                     previous_role_key = existing_role_key
                     needs_mount = player.get("needs_mount")
+                    job = player.get("job")
                     del raid["signups"][existing_role_key]
                     break
 
             standby_entry = raid["standby"].get(str(user_id))
             if needs_mount is None and standby_entry:
                 needs_mount = standby_entry.get("needs_mount")
+            if job is None and standby_entry:
+                job = standby_entry.get("job")
 
             remove_user_from_standby(raid["standby"], user_id)
-            raid["signups"][role_key] = player_from_user(interaction.user) | {"needs_mount": needs_mount}
+            raid["signups"][role_key] = player_from_user(interaction.user) | {
+                "needs_mount": needs_mount,
+                "job": job if job in compatible_jobs(role_key) else None,
+            }
             await save_raid_state(raid)
+            await process_standby_offers(interaction.channel, raid)
 
             role_warning = None
             if isinstance(interaction.user, discord.Member):
                 role_warning = await add_raid_role(interaction.user, raid)
 
-            await self.refresh_messages(interaction, raid)
+            refreshed = await self.refresh_messages(interaction, raid)
 
             if previous_role_key:
                 previous_role_label = ROLE_LABELS.get(previous_role_key, previous_role_key)
@@ -1737,14 +2444,15 @@ class RaidSignupView(ErrorHandledView):
 
             if role_warning:
                 message += f"\n{role_warning}"
+            if not refreshed:
+                message += f"\n{ROSTER_REFRESH_WARNING}"
 
         await interaction.followup.send(message, ephemeral=True)
-        if needs_mount is None:
-            await interaction.followup.send(
-                "Do you still need the mount?",
-                view=MountNeedView(self.signup_message_id, interaction.user.id),
-                ephemeral=True,
-            )
+        await interaction.followup.send(
+            f"Which job will you play as **{role_label}**?",
+            view=JobChoiceView(self.signup_message_id, interaction.user.id, role_key),
+            ephemeral=True,
+        )
 
     async def standby_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1756,6 +2464,10 @@ class RaidSignupView(ErrorHandledView):
 
         if raid["locked"]:
             await interaction.followup.send("This roster is locked.", ephemeral=True)
+            return
+
+        if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            await interaction.followup.send("This raid is completed or awaiting cleanup.", ephemeral=True)
             return
 
         if user_is_signed_up(raid, interaction.user.id):
@@ -1800,11 +2512,12 @@ class RaidSignupView(ErrorHandledView):
 
             if removed_role_label or removed_from_standby:
                 await save_raid_state(raid)
+                await process_standby_offers(interaction.channel, raid)
 
                 if removed_role_label and isinstance(interaction.user, discord.Member):
                     role_warning = await remove_raid_role(interaction.user, raid)
 
-                await self.refresh_messages(interaction, raid)
+                refreshed = await self.refresh_messages(interaction, raid)
 
                 if removed_role_label and removed_from_standby:
                     message = "You have resigned from the roster entirely."
@@ -1815,18 +2528,20 @@ class RaidSignupView(ErrorHandledView):
 
                 if role_warning:
                     message += f"\n{role_warning}"
+                if not refreshed:
+                    message += f"\n{ROSTER_REFRESH_WARNING}"
 
                 await interaction.followup.send(message, ephemeral=True)
                 return
 
         await interaction.followup.send("You're not registered for any role or standby.", ephemeral=True)
 
-    async def refresh_messages(self, interaction: discord.Interaction, raid: dict):
+    async def refresh_messages(self, interaction: discord.Interaction, raid: dict) -> bool:
         channel = interaction.channel
         if channel is None and raid.get("channel_id"):
             channel = bot.get_channel(raid["channel_id"])
 
-        await update_raid_messages(channel, raid)
+        return await update_raid_messages(channel, raid)
 
 
 # --- Slash commands ---
@@ -1842,7 +2557,9 @@ class RaidSignupView(ErrorHandledView):
     message="Optional message sent with the notification ping",
     notify_role=f"Optional role to ping. Defaults to {DEFAULT_NOTIFY_ROLE_NAME}.",
     group="Optional group or team name, such as Group A",
+    duration_minutes="How long the raid runs before it finishes; the completed roster stays visible",
 )
+@app_commands.choices(duration_minutes=DURATION_CHOICES)
 async def raidsetup(
     interaction: discord.Interaction,
     raid_name: str,
@@ -1852,6 +2569,7 @@ async def raidsetup(
     message: str | None = None,
     notify_role: discord.Role | None = None,
     group: str | None = None,
+    duration_minutes: int = 180,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
     allowed, error = require_roster_manager(interaction)
@@ -1870,6 +2588,7 @@ async def raidsetup(
         notify_role=notify_role,
         send_announcement=True,
         meeting_server=meeting_server,
+        duration_minutes=duration_minutes,
     )
 
 
@@ -1881,14 +2600,16 @@ async def raidsetup(
     date="Date in Pacific Time: today, 5/25, May 25, or 2026-05-25. No year means this year.",
     time="Raid time in Pacific Time (PT), such as 20:00, 8:00 PM, or 8PM",
     group="Optional group or team name",
+    duration_minutes="How long the raid runs before it finishes; the completed roster stays visible",
 )
-@app_commands.choices(preset=PRESET_CHOICES)
+@app_commands.choices(preset=PRESET_CHOICES, duration_minutes=DURATION_CHOICES)
 async def raidpreset(
     interaction: discord.Interaction,
     preset: app_commands.Choice[str],
     date: str,
     time: str,
     group: str | None = None,
+    duration_minutes: int = 180,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
     allowed, error = require_roster_manager(interaction)
@@ -1896,7 +2617,7 @@ async def raidpreset(
         await interaction.followup.send(error, ephemeral=True)
         return
 
-    await create_raid(interaction, preset.value, date, time, group_name=group)
+    await create_raid(interaction, preset.value, date, time, group_name=group, duration_minutes=duration_minutes)
 
 
 @tree.command(name="lockroster", description="Lock a roster so players cannot change roles")
@@ -1920,10 +2641,17 @@ async def lockroster(interaction: discord.Interaction, signup_message_id: str | 
         if not raid:
             await interaction.followup.send("That roster was already deleted.", ephemeral=True)
             return
+        if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            await interaction.followup.send("Completed rosters cannot be changed.", ephemeral=True)
+            return
         raid["locked"] = True
         await save_raid_state(raid)
-        await update_raid_messages(interaction.channel, raid)
-    await interaction.followup.send(f"Locked **{raid_title(raid)}**.", ephemeral=True)
+        await cancel_standby_offers(interaction.channel, raid)
+        refreshed = await update_raid_messages(interaction.channel, raid)
+    message = f"Locked **{raid_title(raid)}**."
+    if not refreshed:
+        message += f"\n{ROSTER_REFRESH_WARNING}"
+    await interaction.followup.send(message, ephemeral=True)
 
 
 @tree.command(name="unlockroster", description="Unlock a roster so players can change roles again")
@@ -1947,10 +2675,17 @@ async def unlockroster(interaction: discord.Interaction, signup_message_id: str 
         if not raid:
             await interaction.followup.send("That roster was already deleted.", ephemeral=True)
             return
+        if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            await interaction.followup.send("Completed rosters cannot be reopened.", ephemeral=True)
+            return
         raid["locked"] = False
         await save_raid_state(raid)
-        await update_raid_messages(interaction.channel, raid)
-    await interaction.followup.send(f"Unlocked **{raid_title(raid)}**.", ephemeral=True)
+        await process_standby_offers(interaction.channel, raid)
+        refreshed = await update_raid_messages(interaction.channel, raid)
+    message = f"Unlocked **{raid_title(raid)}**."
+    if not refreshed:
+        message += f"\n{ROSTER_REFRESH_WARNING}"
+    await interaction.followup.send(message, ephemeral=True)
 
 
 @tree.command(name="missingroles", description="Show open roles for a roster")
@@ -1986,13 +2721,18 @@ async def remindraid(interaction: discord.Interaction, signup_message_id: str | 
         await interaction.followup.send(error, ephemeral=True)
         return
 
-    ping_text = reminder_ping_text(interaction.channel, raid)
-    await interaction.channel.send(
-        f"Raid reminder for **{raid_title(raid)}**.\n"
-        f"{schedule_text(raid)}\n"
-        f"Ping: {ping_text}",
-        allowed_mentions=allowed_mentions_for_raid(interaction.channel, raid),
-    )
+    async with get_raid_lock(raid["signup_message_id"]):
+        raid = await fetch_signup(raid["signup_message_id"])
+        if not raid or raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            await interaction.followup.send("Completed or deleted raids cannot send reminders.", ephemeral=True)
+            return
+        ping_text = signed_player_mentions(raid["signups"])
+        await interaction.channel.send(
+            f"Raid reminder for **{raid_title(raid)}**.\n"
+            f"{schedule_text(raid)}\n"
+            f"Ping: {ping_text}",
+            allowed_mentions=allowed_mentions_for_raid(raid),
+        )
     await interaction.followup.send("Reminder sent.", ephemeral=True)
 
 
@@ -2010,11 +2750,11 @@ async def roster(interaction: discord.Interaction, signup_message_id: str | None
         await interaction.followup.send(f"```text\n{chunk}\n```", ephemeral=True)
 
 
-@tree.command(name="raidrole", description="Set the Discord role assigned to signed players and pinged by reminders")
+@tree.command(name="raidrole", description="Set the Discord role assigned to signed players")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True, manage_roles=True)
 @app_commands.describe(
-    role="Discord role to assign to signed players and ping for reminders",
+    role="Dedicated Discord role to assign to signed players",
     signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.",
 )
 async def raidrole(
@@ -2059,6 +2799,9 @@ async def raidrole(
             await interaction.followup.send("That roster was already deleted.", ephemeral=True)
             return
 
+        if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            await interaction.followup.send("Completed rosters cannot change signup roles.", ephemeral=True)
+            return
         warnings = []
         old_role = raid_role_for_guild(interaction.guild, raid)
         old_role_raid = raid.copy()
@@ -2072,6 +2815,8 @@ async def raidrole(
                 member = await fetch_guild_member(interaction.guild, player.get("user_id"))
             except discord.HTTPException:
                 logger.exception("Could not fetch guild member %s for raid role change", player.get("user_id"))
+                if player.get("user_id"):
+                    await queue_role_change(interaction.guild, player["user_id"], role, old_role, raid)
                 warning = "I could not check one or more saved players, so their raid roles may still need updating."
                 if warning not in warnings:
                     warnings.append(warning)
@@ -2080,17 +2825,70 @@ async def raidrole(
                 warning = await add_raid_role(member, raid)
                 if warning and warning not in warnings:
                     warnings.append(warning)
+                if warning:
+                    await queue_role_change(interaction.guild, member.id, role, old_role, raid)
                 if warning is None and old_role and old_role.id != role.id:
                     warning = await remove_raid_role(member, old_role_raid)
                     if warning and warning not in warnings:
                         warnings.append(warning)
 
-        await update_raid_messages(interaction.channel, raid)
+        if not await update_raid_messages(interaction.channel, raid):
+            warnings.append(ROSTER_REFRESH_WARNING)
 
     message = f"Raid role set to {role.mention} for **{raid_title(raid)}**."
     if warnings:
         message += "\n" + "\n".join(warnings)
 
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@tree.command(name="repairraid", description="Repair raid posts and retry saved role updates")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
+async def repairraid(interaction: discord.Interaction, signup_message_id: str | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    allowed, error = require_roster_manager(interaction)
+    if not allowed:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    raid, error = await resolve_raid_for_command(interaction, signup_message_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    async with get_raid_lock(raid["signup_message_id"]):
+        raid = await fetch_signup(raid["signup_message_id"])
+        if not raid or raid.get("cleanup_pending"):
+            await interaction.followup.send("That raid was deleted or is awaiting deletion cleanup.", ephemeral=True)
+            return
+        warnings = await repair_raid_messages(interaction.channel, raid)
+        if raid.get("finished_at") is not None:
+            warnings.extend(await queue_raid_role_cleanup(interaction.guild, raid))
+        else:
+            role = raid_role_for_guild(interaction.guild, raid)
+            for player in raid["signups"].values():
+                user_id = player.get("user_id")
+                if not user_id:
+                    continue
+                try:
+                    member = await fetch_guild_member(interaction.guild, user_id)
+                except discord.HTTPException:
+                    if role is not None:
+                        await queue_role_update(
+                            interaction.guild.id, user_id, role.id, role.name, "add", f"Repair {raid_title(raid)}",
+                        )
+                    warnings.append("I could not check a player's server membership; the role update remains saved for retry.")
+                    continue
+                if member is not None:
+                    warning = await add_raid_role(member, raid)
+                    if warning:
+                        warnings.append(warning)
+        warnings.extend(await retry_pending_role_updates(interaction.guild.id))
+    message = f"Checked posts and roles for **{raid_title(raid)}**."
+    if warnings:
+        message += "\n" + "\n".join(dict.fromkeys(warnings))
+    else:
+        message += " Repairs are complete."
     await interaction.followup.send(message, ephemeral=True)
 
 
@@ -2110,38 +2908,22 @@ async def bumproster(interaction: discord.Interaction, signup_message_id: str | 
         await interaction.followup.send(error, ephemeral=True)
         return
 
-    warning = None
     async with get_raid_lock(raid["signup_message_id"]):
         raid = await fetch_signup(raid["signup_message_id"])
         if not raid:
             await interaction.followup.send("That roster was already deleted.", ephemeral=True)
             return
 
-        old_roster_message_id = raid.get("roster_message_id")
-        new_roster_message = await interaction.channel.send(embed=roster_embed(raid))
-        raid["roster_message_id"] = new_roster_message.id
-        try:
-            await save_raid_state(raid)
-        except aiosqlite.Error:
-            try:
-                await new_roster_message.delete()
-            except discord.HTTPException:
-                logger.exception("Could not remove unsaved bumped roster message %s", new_roster_message.id)
-            raise
+        if raid.get("cleanup_pending"):
+            await interaction.followup.send("This raid is being deleted; role cleanup is pending.", ephemeral=True)
+            return
 
-        if old_roster_message_id:
-            try:
-                old_roster_message = interaction.channel.get_partial_message(old_roster_message_id)
-                await old_roster_message.delete()
-            except discord.NotFound:
-                pass
-            except discord.HTTPException:
-                warning = " I could not delete the old roster post, so you may see a duplicate."
+        warnings = await repair_raid_messages(interaction.channel, raid, repost=True)
 
-    await interaction.followup.send(
-        f"Bumped the roster for **{raid_title(raid)}**.{warning or ''}",
-        ephemeral=True,
-    )
+    message = f"Bumped **{raid_title(raid)}**. New signup message ID: `{raid['signup_message_id']}`."
+    if warnings:
+        message += "\n" + "\n".join(warnings)
+    await interaction.followup.send(message, ephemeral=True)
 
 
 @tree.command(name="clearroster", description="Clear a raid roster and remove assigned raid roles")
@@ -2166,8 +2948,13 @@ async def clearroster(interaction: discord.Interaction, signup_message_id: str |
             await interaction.followup.send("That roster was already deleted.", ephemeral=True)
             return
 
+        if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
+            await interaction.followup.send("Completed rosters cannot be cleared. Use a deletion command to remove one.", ephemeral=True)
+            return
+        await cancel_standby_offers(interaction.channel, raid)
         signed_players = list(raid["signups"].values())
         reset_roster_state(raid)
+        raid["ready_check_started_at"] = None
         await save_raid_state(raid)
 
         warnings = []
@@ -2176,7 +2963,8 @@ async def clearroster(interaction: discord.Interaction, signup_message_id: str |
             if warning and warning not in warnings:
                 warnings.append(warning)
 
-        await update_raid_messages(interaction.channel, raid)
+        if not await update_raid_messages(interaction.channel, raid):
+            warnings.append(ROSTER_REFRESH_WARNING)
 
     message = f"Cleared **{raid_title(raid)}**."
     if warnings:
@@ -2235,7 +3023,7 @@ async def help_command(interaction: discord.Interaction):
             "Creates a raid signup and sends a separate announcement message "
             f"that pings `{DEFAULT_NOTIFY_ROLE_NAME}` by default. This ping role is only notified; players still "
             f"only receive `{DEFAULT_RAID_ROLE_NAME}` when they pick a roster role. `meeting_server` is used for "
-            "the 5-minute raid-start ping. Requires Manage Messages."
+            "the 5-minute raid-start ping. Requires Manage Messages; pinging a nonmentionable role also requires Mention Everyone."
         ),
         inline=False,
     )
@@ -2261,10 +3049,11 @@ async def help_command(interaction: discord.Interaction):
         name="Buttons",
         value=(
             "Role buttons claim open roles. Filled roles are locked. `Standby` lets unsigned players "
-            "mark Tank, DPS, Healer, or all three as Any. `Resign` removes you from both the main roster "
+            "mark Tank, DPS, Healer, or all three as Any. `Leave roster` removes you from both the main roster "
             "and standby, then reopens your main-party spot. "
             "Main roster players receive the configured raid role."
-            " Use `Mount Status` to answer again or correct a previous answer."
+            " Pick a job from the clickable role-specific menu, then answer the mount question. "
+            "Use `Job` or `Mount Status` to change those details later."
         ),
         inline=False,
     )
@@ -2273,7 +3062,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "Click `Standby`, toggle every role type you can cover, then press `Confirm Standby`. "
             "Changes are saved only on confirmation; closing the picker keeps your saved roles. "
-            "The roster shows entries like `@User - Tank`, `@User - DPS/Healer`, or `@User - Any`."
+            "Clear selections edits only the draft. Open matching slots are offered with clickable Accept/Decline "
+            "buttons and a five-minute window; accepting never happens automatically."
         ),
         inline=False,
     )
@@ -2299,7 +3089,7 @@ async def help_command(interaction: discord.Interaction):
         name="/bumproster",
         value=(
             "Deletes the old roster post and reposts the same current roster at the bottom of the channel. "
-            "The saved roster data stays intact. Requires Manage Messages."
+            "The saved roster data stays intact; its signup message ID changes. Requires Manage Messages."
         ),
         inline=False,
     )
@@ -2314,7 +3104,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="/remindraid",
         value=(
-            "Sends a manual reminder message that pings the configured raid role. "
+            "Sends a manual reminder message that pings this roster's signed players. "
             "Requires Manage Messages."
         ),
         inline=False,
@@ -2322,7 +3112,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="/raidrole",
         value=(
-            "Sets the Discord role assigned to signed players and pinged by reminders for an existing roster. "
+            "Sets the dedicated Discord role assigned to signed players for an existing roster. "
             "Requires Manage Messages and Manage Roles. Choose an ordinary role below your highest role "
             "and the bot's role. The server owner is exempt from the caller hierarchy check."
         ),
@@ -2333,10 +3123,20 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "The bot sends one automatic reminder only. It chooses the longest available reminder window: "
             "24 hours, otherwise 12 hours, otherwise 8 hours, otherwise 6 hours before raid time. "
-            "The reminder pings the configured raid role. It also sends a separate 5-minute ping with the "
-            "meeting server and a random cheerful message. Two hours after raid start, the bot removes "
-            "the raid role, deletes the raid posts, and removes the saved roster. The bot must be running "
-            "for reminders and cleanup. Failed role cleanup after deletion is saved and retried each minute."
+            "Reminders ping only this roster's signed players. It also sends a separate 5-minute ping with the "
+            "meeting server and a random cheerful message. After the chosen duration, the bot closes signups "
+            "and removes raid roles while keeping the completed roster. New raids default to three hours. "
+            "Failed role updates are saved and retried each minute. The bot must be running."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Edit, check readiness, finish, and repair",
+        value=(
+            "`/editraid` changes details without losing players; provide both date and time to reschedule. "
+            "`/readycheck` asks signed players to mark Ready, Running late, or Cannot attend. "
+            "`/finishraid` closes a raid early while keeping its completed card. "
+            "`/repairraid` rebuilds missing posts and retries role updates. These commands require Manage Messages."
         ),
         inline=False,
     )
@@ -2352,13 +3152,279 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# --- Raid management and readiness ---
+
+READY_STATUSES = {
+    "ready": "Ready",
+    "late": "Running late",
+    "unavailable": "Cannot attend",
+}
+
+
+class ReadyCheckView(ErrorHandledView):
+    def __init__(self, signup_message_id: int, generation: int):
+        super().__init__(timeout=300)
+        self.signup_message_id = signup_message_id
+        self.generation = generation
+        for status, label in READY_STATUSES.items():
+            button = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.success if status == "ready" else discord.ButtonStyle.secondary,
+                custom_id=f"ready:{signup_message_id}:{generation}:{status}",
+            )
+            button.callback = self.create_status_callback(status)
+            self.add_item(button)
+
+    def create_status_callback(self, status: str):
+        async def callback(interaction: discord.Interaction):
+            await self.set_status(interaction, status)
+
+        return callback
+
+    async def set_status(self, interaction: discord.Interaction, status: str):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.is_finished():
+            await interaction.followup.send("This picker is closed. Open Ready Check on the roster again.", ephemeral=True)
+            return
+        if status not in READY_STATUSES:
+            await interaction.followup.send("That ready-check choice is not available.", ephemeral=True)
+            return
+        async with get_raid_lock(self.signup_message_id):
+            raid = await fetch_signup(self.signup_message_id)
+            if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+                await interaction.followup.send("This raid is no longer accepting ready-check answers.", ephemeral=True)
+                return
+            if raid.get("ready_check_started_at") != self.generation:
+                await interaction.followup.send("This ready check has ended. Open the current Ready Check on the roster.", ephemeral=True)
+                return
+            player = next((p for p in raid["signups"].values() if p.get("user_id") == interaction.user.id), None)
+            if player is None:
+                await interaction.followup.send("Only players on this raid's main roster can answer its ready check.", ephemeral=True)
+                return
+            player["ready_status"] = status
+            await save_raid_state(raid)
+            refreshed = await update_raid_messages(interaction.channel, raid)
+        message = f"Ready check saved: **{READY_STATUSES[status]}**."
+        if not refreshed:
+            message += f"\n{ROSTER_REFRESH_WARNING}"
+        await interaction.followup.send(message, ephemeral=True)
+
+
+async def start_ready_check(interaction: discord.Interaction, raid: dict) -> list[str]:
+    now = int(datetime.now(timezone.utc).timestamp())
+    generation = max(now, (raid.get("ready_check_started_at") or 0) + 1)
+    raid["ready_check_started_at"] = generation
+    for player in raid["signups"].values():
+        player["ready_status"] = None
+    await save_raid_state(raid)
+    warnings = []
+    roster_url = f"https://discord.com/channels/{interaction.guild.id}/{raid['channel_id']}/{raid['signup_message_id']}"
+    try:
+        await interaction.channel.send(
+            f"Ready check for **{raid_title(raid)}**. {signed_player_mentions(raid['signups'])}\n"
+            f"Use **Ready Check** on the [roster]({roster_url}) to choose Ready, Running late, or Cannot attend.",
+            allowed_mentions=allowed_mentions_for_raid(raid),
+        )
+    except discord.HTTPException:
+        logger.exception("Could not post ready check for %s", raid["signup_message_id"])
+        warnings.append("The ready check was started, but I could not post its announcement. Players can use Ready Check on the roster.")
+    if not await update_raid_messages(interaction.channel, raid):
+        warnings.append(ROSTER_REFRESH_WARNING)
+    return warnings
+
+
+async def finish_raid(channel, raid: dict) -> list[str]:
+    newly_finished = raid.get("finished_at") is None
+    if not newly_finished and not raid.get("role_cleanup_pending"):
+        return []
+    if newly_finished:
+        raid["finished_at"] = int(datetime.now(timezone.utc).timestamp())
+        raid["locked"] = True
+        raid["ready_check_started_at"] = None
+        raid["role_cleanup_pending"] = True
+        await save_raid_state(raid)
+    await cancel_standby_offers(channel, raid)
+    guild = getattr(channel, "guild", None)
+    if guild is None and raid.get("guild_id"):
+        guild = bot.get_guild(raid["guild_id"])
+    warnings = await queue_raid_role_cleanup(guild, raid)
+    if not warnings:
+        raid["role_cleanup_pending"] = False
+        await save_raid_state(raid)
+    if newly_finished and not await update_raid_messages(channel, raid):
+        warnings.append(ROSTER_REFRESH_WARNING)
+    return warnings
+
+
+@tree.command(name="editraid", description="Edit a raid without losing signups; provide both date and time to reschedule")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(
+    signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.",
+    raid_name="New raid name",
+    date="New Pacific date; also provide time",
+    time="New Pacific time; also provide date",
+    meeting_server="New meeting world/server; use - to clear",
+    group="New group name; use - to clear",
+    duration_minutes="Automatically finish this many minutes after start (30 to 720)",
+)
+async def editraid(
+    interaction: discord.Interaction,
+    signup_message_id: str | None = None,
+    raid_name: str | None = None,
+    date: str | None = None,
+    time: str | None = None,
+    meeting_server: str | None = None,
+    group: str | None = None,
+    duration_minutes: app_commands.Range[int, 30, 720] | None = None,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    allowed, error = require_roster_manager(interaction)
+    if not allowed:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    if all(value is None for value in (raid_name, date, time, meeting_server, group, duration_minutes)):
+        await interaction.followup.send("Choose at least one field to update.", ephemeral=True)
+        return
+    if (date is None) != (time is None):
+        await interaction.followup.send("Provide both date and time when changing the schedule. Both use Pacific Time.", ephemeral=True)
+        return
+    raid, error = await resolve_raid_for_command(interaction, signup_message_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    async with get_raid_lock(raid["signup_message_id"]):
+        raid = await fetch_signup(raid["signup_message_id"])
+        if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            await interaction.followup.send("Only an active raid can be edited.", ephemeral=True)
+            return
+        try:
+            if duration_minutes is not None and not 30 <= duration_minutes <= 720:
+                raise ValueError("Duration must be between 30 and 720 minutes.")
+            changes = {}
+            if raid_name is not None:
+                name = clean_short_text(raid_name, "Raid name", 100)
+                if not name:
+                    raise ValueError("Raid name cannot be blank.")
+                changes["raid_name"] = name
+            if meeting_server is not None:
+                changes["meeting_server"] = clean_short_text(None if meeting_server.strip() == "-" else meeting_server, "Meeting server", 100)
+            if group is not None:
+                changes["group_name"] = clean_short_text(None if group.strip() == "-" else group, "Group name", 50)
+            if duration_minutes is not None:
+                changes["duration_minutes"] = duration_minutes
+            if date is not None:
+                scheduled_at = parse_raid_datetime(date, time, DEFAULT_TIMEZONE_NAME)
+                if scheduled_at <= int(datetime.now(timezone.utc).timestamp()):
+                    raise ValueError("Choose a future raid date and time in Pacific Time.")
+                changes.update(date=date.strip(), time=time.strip(), scheduled_at=scheduled_at)
+            start = changes.get("scheduled_at", raid.get("scheduled_at"))
+            if duration_minutes is not None and start is not None:
+                if start + duration_minutes * 60 <= int(datetime.now(timezone.utc).timestamp()):
+                    raise ValueError("That duration would end the raid in the past. Choose a longer duration or use /finishraid.")
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        schedule_changed = changes.get("scheduled_at", raid.get("scheduled_at")) != raid.get("scheduled_at")
+        raid.update(changes)
+        if schedule_changed:
+            raid["reminders_sent"] = {}
+            raid["reminder_offset"] = choose_reminder_offset(raid["scheduled_at"])
+            raid["ready_check_started_at"] = None
+            for player in raid["signups"].values():
+                player["ready_status"] = None
+        await save_raid_state(raid)
+        warnings = []
+        if schedule_changed:
+            await cancel_standby_offers(interaction.channel, raid)
+            try:
+                await interaction.channel.send(
+                    f"Schedule updated for **{raid_title(raid)}**: <t:{raid['scheduled_at']}:F> "
+                    f"(<t:{raid['scheduled_at']}:R>).\n{signed_player_mentions(raid['signups'])}",
+                    allowed_mentions=allowed_mentions_for_raid(raid),
+                )
+            except discord.HTTPException:
+                logger.exception("Could not announce schedule change for %s", raid["signup_message_id"])
+                warnings.append("The new schedule was saved, but I could not announce it.")
+        if not await update_raid_messages(interaction.channel, raid):
+            warnings.append(ROSTER_REFRESH_WARNING)
+    message = f"Updated **{raid_title(raid)}** without changing its signups."
+    if warnings:
+        message += "\n" + "\n".join(warnings)
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@tree.command(name="readycheck", description="Ask this raid's signed players whether they are ready")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
+async def readycheck(interaction: discord.Interaction, signup_message_id: str | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    allowed, error = require_roster_manager(interaction)
+    if not allowed:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    raid, error = await resolve_raid_for_command(interaction, signup_message_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    async with get_raid_lock(raid["signup_message_id"]):
+        raid = await fetch_signup(raid["signup_message_id"])
+        if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
+            await interaction.followup.send("Only an active raid can start a ready check.", ephemeral=True)
+            return
+        if not raid["signups"]:
+            await interaction.followup.send("There are no signed players to ready-check yet.", ephemeral=True)
+            return
+        warnings = await start_ready_check(interaction, raid)
+    message = "Ready check started. Players can update their answer from the roster."
+    if warnings:
+        message += "\n" + "\n".join(warnings)
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@tree.command(name="finishraid", description="Finish a raid, close signups, and keep its completed roster visible")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(signup_message_id="Optional signup message ID. Leave blank for newest signup in this channel.")
+async def finishraid(interaction: discord.Interaction, signup_message_id: str | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    allowed, error = require_roster_manager(interaction)
+    if not allowed:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    raid, error = await resolve_raid_for_command(interaction, signup_message_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    async with get_raid_lock(raid["signup_message_id"]):
+        raid = await fetch_signup(raid["signup_message_id"])
+        if not raid or raid.get("cleanup_pending"):
+            await interaction.followup.send("That raid was deleted or is awaiting cleanup.", ephemeral=True)
+            return
+        if raid.get("finished_at") is not None:
+            await interaction.followup.send("This raid is already finished. Its roster remains saved.", ephemeral=True)
+            return
+        warnings = await finish_raid(interaction.channel, raid)
+    message = f"Finished **{raid_title(raid)}**. The completed roster stays visible."
+    if warnings:
+        message += "\n" + "\n".join(warnings)
+    await interaction.followup.send(message, ephemeral=True)
+
+
 # --- Reminders and cleanup ---
 
 def reminder_work_due(raid: dict, now: int) -> bool:
-    if raid.get("cleanup_pending"):
+    if raid.get("cleanup_pending") or raid.get("role_cleanup_pending"):
         return True
-    scheduled_at = raid["scheduled_at"]
-    if now >= scheduled_at + (2 * 60 * 60):
+    if raid.get("finished_at") is not None:
+        return False
+    if raid.get("standby_offers"):
+        return True
+    scheduled_at = raid.get("scheduled_at")
+    if scheduled_at is None:
+        return False
+    if now >= scheduled_at + raid.get("duration_minutes", 120) * 60:
         return True
     if now > scheduled_at:
         return False
@@ -2372,41 +3438,65 @@ def reminder_work_due(raid: dict, now: int) -> bool:
 
 
 async def send_due_reminders():
+    try:
+        for warning in await retry_pending_role_updates():
+            logger.warning("Role recovery: %s", warning)
+    except Exception:
+        logger.exception("Role recovery check failed")
     now = int(datetime.now(timezone.utc).timestamp())
     for snapshot in await fetch_scheduled_raids(now):
         try:
+            now = int(datetime.now(timezone.utc).timestamp())
             if reminder_work_due(snapshot, now):
-                await process_due_raid(snapshot["signup_message_id"], now)
+                await process_due_raid(snapshot["signup_message_id"])
         except Exception:
             logger.exception("Reminder processing failed for %s", snapshot["signup_message_id"])
 
 
-async def process_due_raid(signup_message_id: int, now: int):
+async def process_due_raid(signup_message_id: int):
     async with get_raid_lock(signup_message_id):
         raid = await fetch_signup(signup_message_id)
         if not raid:
             return
 
-        scheduled_at = raid.get("scheduled_at")
-        if scheduled_at is None and not raid.get("cleanup_pending"):
-            return
-
-        if raid.get("cleanup_pending") or now >= scheduled_at + (2 * 60 * 60):
+        now = int(datetime.now(timezone.utc).timestamp())
+        if raid.get("cleanup_pending"):
             channel = await fetch_raid_channel(raid)
-            if channel is None:
-                logger.warning("Post-raid cleanup cannot access channel for %s", signup_message_id)
-                return
-
-            if not raid.get("cleanup_pending"):
-                if not await delete_raid_messages(channel, raid):
-                    logger.warning("Post-raid cleanup could not delete all messages for %s", signup_message_id)
-                    return
-                await mark_raid_cleanup_pending(raid)
-            deleted, warnings = await finish_raid_cleanup(getattr(channel, "guild", None), raid)
+            guild = getattr(channel, "guild", None)
+            if guild is None and raid.get("guild_id"):
+                guild = bot.get_guild(raid["guild_id"])
+            deleted, warnings = await finish_raid_cleanup(guild, raid)
             for warning in warnings:
                 logger.warning("Post-raid cleanup for %s: %s", signup_message_id, warning)
             if deleted:
                 logger.info("Completed post-raid cleanup for %s", signup_message_id)
+            return
+
+        if raid.get("finished_at") is not None:
+            if raid.get("role_cleanup_pending"):
+                channel = await fetch_raid_channel(raid)
+                for warning in await finish_raid(channel, raid):
+                    logger.warning("Finished raid role cleanup for %s: %s", signup_message_id, warning)
+            return
+
+        channel = None
+        channel_loaded = False
+        scheduled_at = raid.get("scheduled_at")
+        finish_at = None if scheduled_at is None else scheduled_at + raid.get("duration_minutes", 120) * 60
+        if raid.get("standby_offers") and (finish_at is None or now < finish_at):
+            channel = await fetch_raid_channel(raid)
+            channel_loaded = True
+            if channel is not None:
+                await process_standby_offers(channel, raid)
+            now = int(datetime.now(timezone.utc).timestamp())
+
+        if scheduled_at is None:
+            return
+        if now >= finish_at:
+            if not channel_loaded:
+                channel = await fetch_raid_channel(raid)
+            for warning in await finish_raid(channel, raid):
+                logger.warning("Automatic finish for %s: %s", signup_message_id, warning)
             return
 
         if now > scheduled_at:
@@ -2419,20 +3509,29 @@ async def process_due_raid(signup_message_id: int, now: int):
             raid["reminder_offset"] = reminder_offset
             await save_reminder_state(raid)
 
+        if not reminder_work_due(raid, now):
+            return
+
+        if not channel_loaded:
+            channel = await fetch_raid_channel(raid)
+        if channel is None:
+            logger.warning("Reminder cannot access channel for %s", signup_message_id)
+            return
+
+        # Lock contention and Discord requests can cross a reminder deadline.
+        now = int(datetime.now(timezone.utc).timestamp())
+        if now > scheduled_at:
+            return
+
         five_minute_due = (
             not raid["reminders_sent"].get("five_minute")
-            and scheduled_at - FIVE_MINUTE_REMINDER_SECONDS <= now <= scheduled_at
+            and now >= scheduled_at - FIVE_MINUTE_REMINDER_SECONDS
         )
         if five_minute_due:
-            channel = await fetch_raid_channel(raid)
-            if channel is None:
-                logger.warning("Five-minute reminder cannot access channel for %s", signup_message_id)
-                return
-
             try:
                 await channel.send(
-                    five_minute_reminder_text(channel, raid),
-                    allowed_mentions=allowed_mentions_for_raid(channel, raid),
+                    five_minute_reminder_text(raid),
+                    allowed_mentions=allowed_mentions_for_raid(raid),
                 )
             except discord.HTTPException:
                 logger.exception("Could not send five-minute reminder for %s", signup_message_id)
@@ -2451,18 +3550,13 @@ async def process_due_raid(signup_message_id: int, now: int):
         if now < scheduled_at - reminder_offset:
             return
 
-        channel = await fetch_raid_channel(raid)
-        if channel is None:
-            logger.warning("Automatic reminder cannot access channel for %s", signup_message_id)
-            return
-
         try:
-            ping_text = reminder_ping_text(channel, raid)
+            ping_text = signed_player_mentions(raid["signups"])
             await channel.send(
                 f"Reminder: **{raid_title(raid)}** starts <t:{scheduled_at}:R>.\n"
                 f"{schedule_text(raid)}\n"
                 f"Ping: {ping_text}",
-                allowed_mentions=allowed_mentions_for_raid(channel, raid),
+                allowed_mentions=allowed_mentions_for_raid(raid),
             )
         except discord.HTTPException:
             logger.exception("Could not send automatic reminder for %s", signup_message_id)
@@ -2509,6 +3603,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @bot.event
 async def on_ready():
+    await backfill_raid_guilds()
     logger.info("Bot ready! Logged in as %s", bot.user)
 
 

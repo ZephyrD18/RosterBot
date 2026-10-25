@@ -25,6 +25,7 @@ class HelperTests(unittest.TestCase):
         }))
         self.assertEqual(signups, {"MT": {
             "user_id": 42, "display_name": "Unknown", "mention": "<@42>", "needs_mount": None,
+            "job": None, "ready_status": None,
         }})
         standby = bot.decode_standby(json.dumps({
             "42": {"user_id": 99, "roles": ["Tank", "Tank", "Healer", "invalid"]},
@@ -49,7 +50,7 @@ class HelperTests(unittest.TestCase):
 
     def test_long_legacy_roster_stays_within_embed_limits(self):
         raid = {
-            "raid_name": "Recollection EX", "scheduled_at": 1789275600,
+            "signup_message_id": 123, "raid_name": "Recollection EX", "scheduled_at": 1789275600, "locked": False,
             "signups": bot.decode_signups(json.dumps({key: "x" * 4000 for key in bot.ROLE_LABELS})),
             "standby": {"42": {
                 "mention": "x" * 4000, "roles": ["Tank"], "needs_mount": None,

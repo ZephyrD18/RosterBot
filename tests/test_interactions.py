@@ -96,8 +96,10 @@ class RoleSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_assignment_returns_warning_after_saved_signup(self):
         event, _ = interaction()
         event.user.add_roles.side_effect = http_error()
-        warning = await bot.add_raid_role(event.user, raid())
+        with patch.object(bot, "save_role_update", new=AsyncMock()) as queue:
+            warning = await bot.add_raid_role(event.user, raid())
         self.assertIn("Your signup was saved", warning)
+        queue.assert_awaited_once()
 
     async def test_cached_roles_do_not_skip_atomic_assignment(self):
         event, role = interaction()
@@ -130,9 +132,11 @@ class RoleSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_reports_member_lookup_failure(self):
         event, _ = interaction()
         with patch.object(bot, "fetch_guild_member", new=AsyncMock(side_effect=http_error())), \
+             patch.object(bot, "queue_role_update", new=AsyncMock()) as queue, \
              self.assertLogs("rosterbot", level="ERROR"):
             warning = await bot.remove_raid_role_from_player(event.guild, raid(), {"user_id": 42})
         self.assertIn("may still need removal", warning)
+        queue.assert_awaited_once()
 
     async def test_role_command_reports_member_lookup_failure(self):
         event, role = interaction()
@@ -142,9 +146,11 @@ class RoleSafetyTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "save_raid_state", new=AsyncMock()), \
              patch.object(bot, "update_raid_messages", new=AsyncMock()), \
              patch.object(bot, "fetch_guild_member", new=AsyncMock(side_effect=http_error())), \
+             patch.object(bot, "queue_role_change", new=AsyncMock()) as queue, \
              self.assertLogs("rosterbot", level="ERROR"):
             await bot.raidrole.callback(event, role)
         self.assertIn("may still need updating", event.followup.send.await_args.args[0])
+        queue.assert_awaited_once()
 
     def test_channel_permission_overwrite_is_respected(self):
         event, _ = interaction()
@@ -197,13 +203,16 @@ class InteractionStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(command.guild_only, command.name)
 
     async def test_message_updates_use_known_ids_without_fetching(self):
-        message = SimpleNamespace(edit=AsyncMock())
+        message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
         channel = SimpleNamespace(get_partial_message=Mock(return_value=message))
-        with patch.object(bot, "signup_embed", return_value=None), \
-             patch.object(bot, "roster_embed", return_value=None):
+        with (
+            patch.object(bot, "roster_embed", return_value=None),
+            patch.object(bot, "save_raid_state", new=AsyncMock()),
+        ):
             self.assertTrue(await bot.update_raid_messages(channel, raid()))
         self.assertEqual([call.args[0] for call in channel.get_partial_message.call_args_list], [123, 456])
-        self.assertEqual(message.edit.await_count, 2)
+        message.edit.assert_awaited_once()
+        message.delete.assert_awaited_once()
 
     async def test_partial_post_deletion_keeps_saved_roster_and_roles(self):
         event, _ = interaction()

@@ -46,6 +46,7 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
         self.raid["standby"]["42"] = bot.player_from_user(self.event().user) | {
             "roles": roles,
             "needs_mount": needs_mount,
+            "job": "Warrior" if "Tank" in roles else None,
         }
         await bot.save_raid_state(self.raid)
 
@@ -72,7 +73,8 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
         await view.confirm_callback(event)
         self.assertEqual((await bot.fetch_signup(123))["standby"]["42"]["roles"], ["Healer"])
         self.refresh.assert_awaited_once()
-        self.assertEqual(event.followup.send.await_args.args[0], "Do you still need the mount?")
+        self.assertEqual(event.followup.send.await_args.args[0], "What job will you play?")
+        self.assertIsInstance(event.followup.send.await_args.kwargs["view"], bot.JobChoiceView)
         event.followup.send.await_args.kwargs["view"].stop()
 
     async def test_confirm_preserves_mount_answer_and_copies_roles(self):
