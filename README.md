@@ -13,7 +13,7 @@ $env:DISCORD_TOKEN="YOUR_TOKEN_HERE"
 & "$env:LOCALAPPDATA\RosterBot\venv\Scripts\python.exe" bot.py
 ```
 
-Environment variable names are documented in `.env.example` as a reference. Set them in PowerShell or Railway;
+Environment variable names are documented in `.env.example` as a reference. Set them in PowerShell or the hosting panel's Environment tab;
 the file is not loaded automatically. The bot requires `DISCORD_TOKEN`, while the other settings have local defaults.
 
 Raid dates and entered times use Pacific Time (PT); posted Discord timestamps display in each viewer's timezone.
@@ -26,19 +26,23 @@ Existing signup posts receive updated buttons when the roster is next refreshed.
 After deletion, failed role cleanup stays saved and retries each minute while the bot can access the server.
 Pending cleanup is excluded from active rosters; retry immediately using either deletion command with its signup message ID.
 
-## Railway Deploy
+## bot-hosting.net
 
-1. Push this folder to a GitHub repository.
-2. Create a new Railway project from that GitHub repository.
-3. Add an environment variable named `DISCORD_TOKEN` with your Discord bot token.
-4. Railway will install `requirements.txt` and run `python bot.py`.
+The only source files needed to run the bot are `bot.py` and `requirements.txt`.
 
-The bot uses SQLite. To keep rosters across Railway deployments and restarts:
+1. Use the Python runtime; Python 3.12 is the tested version. Select the version in the panel.
+2. Upload both files to the deployment root, or sync this repository's `main` branch.
+3. In Startup, set **Entry File (STARTUP_FILE)** to `bot.py`. The host installs `requirements.txt` at startup.
+4. In Environment, set `DISCORD_TOKEN` and mark it secret. Start or restart the deployment and check Console.
 
-1. Add a Railway volume mounted at `/data`.
-2. Add `ROSTERBOT_DB_PATH=/data/raids.db` to the worker service variables.
+See the official [setup guide](https://bot-hosting.net/docs/guides/set-up-a-deployment)
+and [Python environment support](https://bot-hosting.net/python-hosting).
 
-Without a volume, Railway's local service disk is temporary and saved rosters may be lost during a redeploy.
+The bot stores rosters in `raids.db` in the deployment root by default. Keep that file when updating;
+retain `ROSTERBOT_DB_PATH` if you already use a custom database location. Stop the bot before making a database backup.
+For GitHub updates, select **Merge** to preserve the existing database; **Replace all files** deletes existing server files.
+See the [GitHub sync guide](https://bot-hosting.net/docs/guides/clone-a-github-repository).
+Remove obsolete startup overrides and let the Python runtime launch `bot.py`.
 Run one bot instance against the database; its interaction and role locks coordinate tasks within that process.
 
 ## Dependencies

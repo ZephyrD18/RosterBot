@@ -33,9 +33,13 @@ Verification used an isolated Windows Python 3.12 environment outside the projec
 Run the bot as a single instance against its SQLite database; its locks coordinate tasks within one process.
 Install the updated requirements before restarting or redeploying. Dependency sources, licenses, and installation commands are in `README.md`.
 
-Live Discord permissions, notification delivery, rate limits, reconnect behavior, and Railway deployment were not exercised.
+Live Discord permissions, notification delivery, rate limits, reconnect behavior, and the hosted deployment were not exercised.
 Tests use mocked Discord operations; no token was used and no server messages or roles were changed.
 The timezone helpers implement US rules in effect since 2007. Role-removal failures during resigning or clearing an active roster are reported for manual correction; durable background retry applies to deletion cleanup.
 Applying these source changes requires updating and restarting or redeploying the running bot. Previously saved wrong-year raids are not automatically rescheduled.
 Reminder delivery and its database acknowledgment are separate operations, so a crash between them can still produce a duplicate notification.
 No production load benchmark was run; performance improvements are supported by request counts, scheduler assertions, and query plans.
+
+Hosting configuration now targets bot-hosting.net. Removed the unused buildpack runtime selector and deployment/startup files.
+The Python bot already uses the host's supported environment variables and dependency installation, so no runtime adapter or new dependency was needed.
+The README documents the entry file, minimal upload files, and database-preserving GitHub sync settings from the official hosting guides.
