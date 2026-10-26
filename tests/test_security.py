@@ -26,6 +26,7 @@ class RoleSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.raid = {
             "signup_message_id": 123, "raid_name": "Test raid",
             "raid_role_id": self.role.id, "raid_role_name": self.role.name,
+            "locked": False,
             "signups": {"MT": {"user_id": 42, "mention": "<@42>"}},
         }
 
@@ -81,7 +82,7 @@ class RoleSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.raid["raid_role_id"] = None
         self.assertIs(bot.raid_role_for_guild(self.guild, self.raid), self.role)
 
-    def test_reminders_only_ping_signed_players(self):
+    def test_start_reminders_exclude_unqualified_standby_and_role_mentions(self):
         self.role.mentionable = True
         self.raid["standby"] = {"43": {"user_id": 43, "mention": "<@43>"}}
         reminder = bot.five_minute_reminder_text(self.raid | {"scheduled_at": 123})

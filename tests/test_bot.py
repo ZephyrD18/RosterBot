@@ -244,7 +244,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         raid = await bot.fetch_signup(interaction.channel.messages[0].id)
         self.assertEqual(raid["announcement_message_id"], interaction.channel.messages[1].id)
         self.assertIsNone(raid["roster_message_id"])
-        self.assertEqual(raid["duration_minutes"], 180)
+        self.assertNotIn("duration_minutes", raid)
+        self.assertIn("two hours after", interaction.followup.messages[-1])
 
     async def test_failed_announcement_does_not_delete_saved_signup(self):
         interaction = FakeInteraction(fail_on_send=2)

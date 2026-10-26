@@ -1,6 +1,6 @@
 # RosterBot Coordinator
 
-Discord bot for FFXIV raid signups, job selection, standby offers, ready checks, and roster-specific reminders.
+Discord bot for FFXIV raid signups, job selection, flexible standby, ready checks, and roster-specific reminders.
 
 ## Signups and Jobs
 
@@ -20,18 +20,17 @@ a job picker from your old slot cannot change your new signup.
 These are the 21 standard raid jobs, grouped using the official [FFXIV job guide](https://na.finalfantasyxiv.com/jobguide/battle/).
 Limited jobs are excluded from this standard raid composition. No game artwork is bundled.
 
-New raids use one blue-and-gold roster card showing occupancy, jobs, mount counts, duration, and readiness.
+New raids use one blue-and-gold roster card showing occupancy, jobs, mount counts, and readiness.
 Old separate signup/roster posts consolidate on their next successful refresh.
 
 ## Running a Raid
 
-- `/raidsetup` creates a card and announcement; `/raidpreset` creates a card from a preset. Choose a duration from the menu;
-  new raids default to **three hours**. Existing saved raids retain their former two-hour duration.
-- `/editraid` changes the name, group, meeting world, duration, or schedule while preserving signups. Provide both Pacific date
+- `/raidsetup` creates a card and announcement; `/raidpreset` creates a card from a preset.
+- `/editraid` changes the name, group, meeting world, or schedule while preserving signups. Provide both Pacific date
   and time to reschedule. Rescheduling resets reminders/readiness and announces the change to that roster's players.
 - `/readycheck` asks signed players to use the card's **Ready check** button, then choose **Ready**, **Running late**, or **Cannot attend**.
-- At the chosen end time, the bot closes signups and removes signup roles while keeping the completed roster visible.
-  `/finishraid` finishes early. Completed raids cannot be reopened, cleared, edited, or manually reminded.
+- **Two hours after the scheduled start**, the bot deletes the roster and its tracked posts and removes signup roles.
+  Auto-finish, selectable durations, and `/finishraid` are removed. Older duration settings do not extend cleanup.
 - `/repairraid` repairs the card and retries failed role updates. If a missing card must be recreated, its signup message ID changes.
   `/bumproster` moves the whole interactive card and also changes its ID. Use the current card's footer for later commands.
 - `/clearroster` clears an active roster. `/deleteraid` and `/deleteroster` explicitly delete a roster and its tracked posts.
@@ -63,18 +62,23 @@ Raid dates and entered times use Pacific Time (PT); posted Discord timestamps di
 Use `today`, a month/day such as `10/24`, or an explicit year such as `2027-01-01`.
 Omitting the year means the current Pacific year. Past dates and times return an error instead of moving to another year.
 
-Standby selections stay private until **Confirm Standby** is pressed. Clear the selections and confirm to leave standby.
+Standby offers four choices: **Tank**, **Healer**, **Melee DPS**, and **Range DPS**. Select any combination and press
+**Confirm Standby**. Clear the selections and confirm to leave standby. Standby does not require choosing one job or answering
+the mount question; those choices appear after claiming a main slot. Existing broad **DPS** selections migrate to both DPS categories.
 Selected buttons are highlighted; **Clear selections** only changes the draft until confirmed.
-Compatible standby players receive a clickable **Accept / Decline** offer when a matching slot is open.
-Offers expire after five minutes; accepting rechecks the vacancy and preserves your job and mount answer when compatible.
-Offers survive bot restarts, and declined candidates are not repeatedly pinged for the same vacancy.
+Five minutes before start, standby players are pinged only if they can fill a currently open slot. They click the normal roster
+role button, then choose a job. Range DPS matches both Physical Ranged and Caster; Melee DPS matches either melee slot.
+There are no Accept/Decline offers or reserved slots. A full roster sends a simple start reminder and does not ping standby.
+The final reminder uses static wording and deletes at the raid start. Its message IDs are saved for cleanup after restart or
+Discord failures. Rescheduling removes an old final reminder before changing the time. Earlier automatic reminders remain visible.
 The **Mount Status** button reopens the mount question, including on locked rosters.
 Existing signup posts receive updated buttons when the roster is next refreshed.
 Failed role updates retry each minute while the bot can access the server.
 Pending cleanup is excluded from active rosters; retry immediately using either deletion command with its signup message ID.
 New rosters save their server ID so pending role cleanup can continue after the channel disappears.
 Existing rosters acquire that ID when their channel is cached at startup or subsequently resolved.
-Reminders mention only the players signed to that roster; standby players and other rosters are excluded.
+Early reminders mention only signed players. The final reminder also includes matching standby players when a slot is open.
+Large groups split across bounded messages, with each player mentioned once per successful delivery.
 If a saved change cannot refresh the public posts, the bot reports it instead of claiming the display is current.
 Use `/repairraid` after correcting the bot's channel permissions or losing a roster post.
 

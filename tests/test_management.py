@@ -2,7 +2,10 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiosqlite
 
 import bot
 from test_bot import sample_raid
@@ -17,10 +20,8 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         await bot.init_db()
         self.raid = sample_raid() | {
             "scheduled_at": 2_000_000_000,
-            "duration_minutes": 180,
             "finished_at": None,
             "ready_check_started_at": 100,
-            "standby_offers": {},
             "signups": {
                 "MT": {
                     "user_id": 42, "display_name": "Tester", "mention": "<@42>",
@@ -37,13 +38,18 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         bot.DB_PATH = self.original_db_path
         self.directory.cleanup()
 
+    async def save_legacy_completion(self, finished_at):
+        # Completion records are retained from the retired feature, not created by current commands.
+        async with aiosqlite.connect(bot.DB_PATH) as db:
+            await db.execute("UPDATE signups SET finished_at = ?, locked = 1 WHERE signup_message_id = 123", (finished_at,))
+            await db.commit()
+
     async def test_reschedule_preserves_signup_job_and_mount_and_resets_readiness(self):
         self.raid["reminders_sent"] = {"automatic": True, "five_minute": True}
         await bot.save_raid_state(self.raid)
         with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)):
-            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM", duration_minutes=240)
+            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM")
         saved = await bot.fetch_signup(123)
-        self.assertEqual(saved["duration_minutes"], 240)
         self.assertEqual(saved["scheduled_at"], bot.parse_raid_datetime("12/31/2099", "8PM", "PT"))
         self.assertEqual(saved["signups"]["MT"]["job"], "Warrior")
         self.assertFalse(saved["signups"]["MT"]["needs_mount"])
@@ -67,10 +73,43 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(bot.ROSTER_REFRESH_WARNING, self.event.followup.send.await_args.args[0])
         self.event.channel.send.assert_not_awaited()
 
+    async def test_reschedule_deletes_old_start_reminder_before_saving_new_time(self):
+        self.raid["start_reminder_message_ids"] = [555]
+        self.raid["reminders_sent"] = {"five_minute": True}
+        await bot.save_raid_state(self.raid)
+        message = SimpleNamespace(delete=AsyncMock())
+        self.event.channel.get_partial_message = Mock(return_value=message)
+        with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)):
+            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM")
+        message.delete.assert_awaited_once()
+        self.event.channel.get_partial_message.assert_called_once_with(555)
+        saved = await bot.fetch_signup(123)
+        self.assertEqual(saved["start_reminder_message_ids"], [])
+        self.assertEqual(saved["reminders_sent"], {})
+        self.assertEqual(saved["scheduled_at"], bot.parse_raid_datetime("12/31/2099", "8PM", "PT"))
+
+    async def test_failed_old_reminder_cleanup_preserves_schedule_and_reminder_flags(self):
+        self.raid["start_reminder_message_ids"] = [555]
+        self.raid["reminders_sent"] = {"automatic": True, "five_minute": True}
+        await bot.save_raid_state(self.raid)
+        with (
+            patch.object(bot, "delete_start_reminders", new=AsyncMock(return_value=False)) as cleanup,
+            patch.object(bot, "update_raid_messages", new=AsyncMock()) as refresh,
+        ):
+            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM")
+        cleanup.assert_awaited_once()
+        refresh.assert_not_awaited()
+        self.event.channel.send.assert_not_awaited()
+        saved = await bot.fetch_signup(123)
+        self.assertEqual(saved["scheduled_at"], self.raid["scheduled_at"])
+        self.assertEqual(saved["start_reminder_message_ids"], [555])
+        self.assertEqual(saved["reminders_sent"], self.raid["reminders_sent"])
+        self.assertEqual(saved["ready_check_started_at"], 100)
+        self.assertIn("schedule was not changed", self.event.followup.send.await_args.args[0])
+
     async def test_invalid_edits_do_not_change_saved_raid(self):
         for arguments, expected in (
             ({"date": "12/31/2099"}, "both date and time"),
-            ({"duration_minutes": 0}, "Duration must"),
             ({"date": "1/1/2000", "time": "8PM"}, "future"),
             ({"raid_name": " "}, "cannot be blank"),
         ):
@@ -81,8 +120,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.event.channel.send.assert_not_awaited()
 
     async def test_finished_raid_cannot_be_edited_or_ready_checked(self):
-        self.raid["finished_at"] = 101
-        await bot.save_raid_state(self.raid)
+        await self.save_legacy_completion(101)
         for command, arguments in ((bot.editraid, {"raid_name": "Changed"}), (bot.readycheck, {})):
             await command.callback(self.event, **arguments)
             self.assertIn("Only an active raid", self.event.followup.send.await_args.args[0])
@@ -127,51 +165,8 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, 101)
         self.assertEqual(second, 102)
 
-    async def test_automatic_finish_keeps_roster_and_removes_roles(self):
-        now = self.raid["scheduled_at"] + 180 * 60
-        with (
-            patch.object(bot, "datetime") as clock,
-            patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=self.event.channel)),
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=[])) as cleanup,
-            patch.object(bot, "delete_raid_messages", new=AsyncMock()) as delete,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)),
-        ):
-            clock.now.return_value = datetime.fromtimestamp(now, timezone.utc)
-            await bot.process_due_raid(123)
-        saved = await bot.fetch_signup(123)
-        self.assertEqual(saved["finished_at"], now)
-        self.assertTrue(saved["locked"])
-        self.assertEqual(saved["signups"]["MT"]["job"], "Warrior")
-        cleanup.assert_awaited_once()
-        delete.assert_not_awaited()
-        self.assertFalse(bot.reminder_work_due(saved, now + 60))
-
-    async def test_finish_without_channel_still_uses_saved_server(self):
-        with (
-            patch.object(bot.bot, "get_guild", return_value=self.event.guild),
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=["Retry queued"])) as cleanup,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=False)),
-        ):
-            warnings = await bot.finish_raid(None, self.raid)
-        self.assertIsNotNone((await bot.fetch_signup(123))["finished_at"])
-        self.assertIs(cleanup.await_args.args[0], self.event.guild)
-        self.assertIn("Retry queued", warnings)
-        self.assertIn(bot.ROSTER_REFRESH_WARNING, warnings)
-
-    async def test_finish_command_is_idempotent(self):
-        with (
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=[])) as cleanup,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)),
-        ):
-            await bot.finishraid.callback(self.event)
-            await bot.finishraid.callback(self.event)
-        cleanup.assert_awaited_once()
-        self.assertIn("already finished", self.event.followup.send.await_args.args[0])
-
     async def test_completed_roster_rejects_unlock_clear_lock_and_role_changes(self):
-        self.raid["finished_at"] = 1234
-        self.raid["locked"] = True
-        await bot.save_raid_state(self.raid)
+        await self.save_legacy_completion(1234)
         for command, arguments in (
             (bot.unlockroster, ()), (bot.clearroster, ()),
             (bot.lockroster, ()), (bot.raidrole, (self.role,)),
@@ -195,9 +190,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_reminder_rechecks_completed_state_after_resolving(self):
         async def resolve(*_):
             snapshot = await bot.fetch_signup(123)
-            self.raid["finished_at"] = 1234
-            self.raid["locked"] = True
-            await bot.save_raid_state(self.raid)
+            await self.save_legacy_completion(1234)
             return snapshot, None
 
         with patch.object(bot, "resolve_raid_for_command", side_effect=resolve):
@@ -205,57 +198,8 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.event.channel.send.assert_not_awaited()
         self.assertIn("cannot send reminders", self.event.followup.send.await_args.args[0])
 
-    async def test_shortened_duration_cannot_end_raid_in_the_past(self):
-        now = self.raid["scheduled_at"] + 60 * 60
-        with (
-            patch.object(bot, "datetime") as clock,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)),
-        ):
-            clock.now.return_value = datetime.fromtimestamp(now, timezone.utc)
-            await bot.editraid.callback(self.event, duration_minutes=30)
-            self.assertIn("end the raid in the past", self.event.followup.send.await_args.args[0])
-            self.assertEqual((await bot.fetch_signup(123))["duration_minutes"], 180)
-            await bot.editraid.callback(self.event, duration_minutes=120)
-        saved = await bot.fetch_signup(123)
-        self.assertEqual(saved["duration_minutes"], 120)
-        self.assertIsNone(saved["finished_at"])
-
-    async def test_interrupted_finish_recovers_role_cleanup_after_restart(self):
-        with patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(side_effect=RuntimeError("Interrupted"))):
-            with self.assertRaisesRegex(RuntimeError, "Interrupted"):
-                await bot.finish_raid(self.event.channel, self.raid)
-        saved = await bot.fetch_signup(123)
-        finished_at = saved["finished_at"]
-        self.assertTrue(saved["role_cleanup_pending"])
-        self.assertTrue(bot.reminder_work_due(saved, finished_at + 60))
-        self.assertIn(123, {raid["signup_message_id"] for raid in await bot.fetch_scheduled_raids(0)})
-        await bot.init_db()
-        with (
-            patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=self.event.channel)),
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=[])) as cleanup,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)),
-        ):
-            await bot.process_due_raid(123)
-        saved = await bot.fetch_signup(123)
-        cleanup.assert_awaited_once()
-        self.assertFalse(saved["role_cleanup_pending"])
-        self.assertEqual(saved["finished_at"], finished_at)
-
-    async def test_role_cleanup_warning_keeps_finished_raid_due_for_retry(self):
-        with (
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=["Role removal queued"])),
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)),
-        ):
-            await bot.finish_raid(self.event.channel, self.raid)
-        saved = await bot.fetch_signup(123)
-        self.assertTrue(saved["role_cleanup_pending"])
-        self.assertTrue(bot.reminder_work_due(saved, saved["finished_at"] + 60))
-        with (
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=["Role removal queued"])),
-            patch.object(bot, "save_raid_state", new=AsyncMock(wraps=bot.save_raid_state)) as save,
-            patch.object(bot, "update_raid_messages", new=AsyncMock()) as refresh,
-        ):
-            await bot.finish_raid(self.event.channel, saved)
-        save.assert_not_awaited()
-        refresh.assert_not_awaited()
+    def test_fixed_cleanup_has_no_finish_command_or_duration_setting(self):
+        self.assertNotIn("finishraid", {command.name for command in bot.tree.get_commands()})
+        for command in (bot.raidsetup, bot.raidpreset, bot.editraid):
+            self.assertNotIn("duration_minutes", {parameter.name for parameter in command.parameters})
 

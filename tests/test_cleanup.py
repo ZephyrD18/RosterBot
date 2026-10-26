@@ -76,42 +76,38 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
         remove.assert_awaited_once()
         self.assertIsNone(await bot.fetch_signup(123))
 
-    async def test_deleted_channel_does_not_prevent_finish_and_role_cleanup(self):
+    async def test_deleted_channel_does_not_prevent_expired_raid_role_cleanup(self):
         response = SimpleNamespace(status=404, reason="Not Found")
         with (
             patch.object(bot.bot, "get_channel", return_value=None),
             patch.object(bot.bot, "fetch_channel", new=AsyncMock(side_effect=bot.discord.NotFound(response, "Deleted"))),
             patch.object(bot.bot, "get_guild", return_value=self.event.guild),
             patch.object(bot, "delete_raid_messages", new=AsyncMock()) as posts,
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=[])) as remove,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=False)),
+            patch.object(bot, "remove_all_raid_roles", new=AsyncMock(return_value=[])) as remove,
             patch.object(bot, "datetime") as clock,
-            self.assertLogs("rosterbot", level="WARNING"),
         ):
             clock.now.return_value = datetime.fromtimestamp(self.raid["scheduled_at"] + 7200, timezone.utc)
             await bot.process_due_raid(123)
         posts.assert_not_awaited()
         remove.assert_awaited_once()
-        saved = await bot.fetch_signup(123)
-        self.assertIsNotNone(saved["finished_at"])
-        self.assertTrue(saved["locked"])
-        self.assertEqual(saved["signups"]["MT"]["user_id"], 42)
+        self.assertIsNone(await bot.fetch_signup(123))
 
-    async def test_inaccessible_channel_finishes_raid_and_retains_failed_role_cleanup(self):
+    async def test_forbidden_channel_keeps_active_roster_and_roles_for_retry(self):
+        response = SimpleNamespace(status=403, reason="Forbidden")
         with (
-            patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=None)),
-            patch.object(bot.bot, "get_guild", return_value=None),
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=["Saved for retry"])) as remove,
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=False)),
+            patch.object(bot.bot, "get_channel", return_value=None),
+            patch.object(bot.bot, "fetch_channel", new=AsyncMock(side_effect=bot.discord.Forbidden(response, "Cannot access"))),
+            patch.object(bot, "remove_all_raid_roles", new=AsyncMock()) as remove,
             patch.object(bot, "datetime") as clock,
             self.assertLogs("rosterbot", level="WARNING"),
         ):
             clock.now.return_value = datetime.fromtimestamp(self.raid["scheduled_at"] + 7200, timezone.utc)
             await bot.process_due_raid(123)
-        remove.assert_awaited_once()
+        remove.assert_not_awaited()
         saved = await bot.fetch_signup(123)
         self.assertFalse(saved["cleanup_pending"])
-        self.assertIsNotNone(saved["finished_at"])
+        self.assertIsNone(saved["finished_at"])
+        self.assertEqual(saved["signups"]["MT"]["user_id"], 42)
 
     async def test_legacy_server_backfill_preserves_saved_server_ids(self):
         legacy = self.raid | {"signup_message_id": 124, "guild_id": None}

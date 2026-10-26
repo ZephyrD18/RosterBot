@@ -87,7 +87,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             "roles": ["Tank"], "needs_mount": False,
         }
         await bot.save_raid_state(self.raid)
-        for selected_roles in (["DPS"], []):
+        for selected_roles in (["Melee DPS", "Range DPS"], []):
             with self.subTest(selected_roles=selected_roles):
                 view = bot.StandbyRoleView(123, 42, selected_roles)
                 try:

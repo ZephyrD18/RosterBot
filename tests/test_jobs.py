@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import aiosqlite
+
 import bot
 from test_bot import sample_raid
 from test_interactions import interaction
@@ -99,7 +101,9 @@ class JobChoiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_raid_rejects_job_changes_and_disables_all_buttons(self):
         self.raid["finished_at"] = 1234
         self.raid["locked"] = True
-        await bot.save_raid_state(self.raid)
+        async with aiosqlite.connect(bot.DB_PATH) as db:
+            await db.execute("UPDATE signups SET finished_at = 1234, locked = 1 WHERE signup_message_id = 123")
+            await db.commit()
         picker = bot.JobChoiceView(123, 42, "MT")
         await picker.set_job(self.event, "Warrior")
         self.assertIsNone((await bot.fetch_signup(123))["signups"]["MT"]["job"])
@@ -117,13 +121,13 @@ class JobChoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await bot.fetch_signup(123))["signups"]["MT"]["job"], "Warrior")
         self.event.edit_original_response.await_args.kwargs["view"].stop()
 
-    async def test_standby_job_menu_is_filtered_to_confirmed_roles(self):
+    async def test_standby_player_selects_a_main_role_before_choosing_a_job(self):
         self.raid["signups"] = {}
         self.raid["standby"]["42"] = bot.player_from_user(self.event.user) | {"roles": ["Healer"]}
         await bot.save_raid_state(self.raid)
-        view = bot.JobChoiceView(123, 42, None, ["Healer"])
-        self.assertEqual(tuple(option.value for option in view.menu.options), bot.JOB_GROUPS["Healer"])
-        with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)):
-            await view.set_job(self.event, "Sage")
-        self.assertEqual((await bot.fetch_signup(123))["standby"]["42"]["job"], "Sage")
-        self.event.edit_original_response.await_args.kwargs["view"].stop()
+        view = bot.RaidSignupView(self.raid)
+        await view.job_callback(self.event)
+        self.assertIn("Choose an open roster role first", self.event.followup.send.await_args.args[0])
+        self.assertNotIn("view", self.event.followup.send.await_args.kwargs)
+        self.assertIsNone((await bot.fetch_signup(123))["standby"]["42"]["job"])
+        view.stop()

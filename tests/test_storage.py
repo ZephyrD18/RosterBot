@@ -166,19 +166,21 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_final_reminder_suppresses_stale_automatic_reminder(self):
         now = 1_000_000
         await bot.insert_raid(make_raid(scheduled_at=now + 240))
-        channel = SimpleNamespace(guild=None, send=AsyncMock())
+        channel = SimpleNamespace(guild=None, send=AsyncMock(return_value=SimpleNamespace(id=1000, delete=AsyncMock())))
         with patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=channel)):
             await self.run_reminders(now)
             await self.run_reminders(now + 60)
 
         self.assertEqual(channel.send.await_count, 1)
-        self.assertIn(f"starts <t:{now + 240}:R>", channel.send.await_args.args[0])
+        self.assertIn("starts in 4 minutes", channel.send.await_args.args[0])
+        self.assertNotIn(":R>", channel.send.await_args.args[0])
         self.assertTrue((await bot.fetch_signup(123))["reminders_sent"]["five_minute"])
+        self.assertEqual((await bot.fetch_signup(123))["start_reminder_message_ids"], [1000])
 
     async def test_delayed_automatic_reminder_uses_actual_discord_timestamp(self):
         now = 1_000_000
         await bot.insert_raid(make_raid(scheduled_at=now + 3600))
-        channel = SimpleNamespace(guild=None, send=AsyncMock())
+        channel = SimpleNamespace(guild=None, send=AsyncMock(return_value=SimpleNamespace(id=1000, delete=AsyncMock())))
         with patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=channel)):
             await self.run_reminders(now)
 
@@ -233,7 +235,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(seconds_until=seconds_until, delay=delay):
                 await bot.insert_raid(make_raid(message_id, now + seconds_until))
-                channel = SimpleNamespace(guild=None, send=AsyncMock())
+                channel = SimpleNamespace(guild=None, send=AsyncMock(return_value=SimpleNamespace(id=1000, delete=AsyncMock())))
                 with patch.object(bot, "datetime") as clock:
                     clock.now.return_value = datetime.fromtimestamp(now, timezone.utc)
 
@@ -274,51 +276,79 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         finally:
             view.stop()
 
-    async def test_automatic_finish_saves_completed_state_before_role_removal(self):
+    async def test_automatic_deletion_marks_members_pending_before_role_removal(self):
         now = 1_000_000
         await bot.insert_raid(make_raid(scheduled_at=now - 7200))
         channel = SimpleNamespace(guild=object())
 
         async def remove_roles(guild, raid):
             saved = await bot.fetch_signup(raid["signup_message_id"])
-            self.assertFalse(saved["cleanup_pending"])
-            self.assertEqual(saved["finished_at"], now)
+            self.assertTrue(saved["cleanup_pending"])
+            self.assertIsNone(saved["finished_at"])
             self.assertTrue(saved["locked"])
+            posts.assert_awaited_once()
             return []
 
         with (
             patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=channel)),
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)),
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(side_effect=remove_roles)) as remove,
+            patch.object(bot, "delete_raid_messages", new=AsyncMock(return_value=True)) as posts,
+            patch.object(bot, "remove_all_raid_roles", new=AsyncMock(side_effect=remove_roles)) as remove,
         ):
             await self.run_reminders(now)
 
         remove.assert_awaited_once()
+        self.assertIsNone(await bot.fetch_signup(123))
 
-    async def test_failed_completed_post_refresh_keeps_roster_and_still_cleans_roles(self):
+    async def test_failed_post_deletion_keeps_roster_and_assigned_roles_for_retry(self):
         now = 1_000_000
         await bot.insert_raid(make_raid(scheduled_at=now - 7200))
         with (
             patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=object())),
-            patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=False)),
-            patch.object(bot, "queue_raid_role_cleanup", new=AsyncMock(return_value=[])) as remove,
+            patch.object(bot, "delete_raid_messages", new=AsyncMock(return_value=False)),
+            patch.object(bot, "remove_all_raid_roles", new=AsyncMock()) as remove,
             self.assertLogs("rosterbot", level="WARNING"),
         ):
             await self.run_reminders(now)
 
         saved = await bot.fetch_signup(123)
-        self.assertEqual(saved["finished_at"], now)
-        self.assertTrue(saved["locked"])
+        self.assertIsNone(saved["finished_at"])
+        self.assertFalse(saved["cleanup_pending"])
+        remove.assert_not_awaited()
+
+    async def test_two_hour_boundary_ignores_retired_duration_and_completed_state(self):
+        now = 1_000_000
+        await bot.insert_raid(make_raid(scheduled_at=now - 7200))
+        async with aiosqlite.connect(bot.DB_PATH) as db:
+            await db.execute("ALTER TABLE signups ADD COLUMN duration_minutes INTEGER")
+            await db.execute("UPDATE signups SET duration_minutes = 360, finished_at = ?", (now - 60,))
+            await db.commit()
+        channel = SimpleNamespace(guild=object())
+        with (
+            patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=channel)) as fetch,
+            patch.object(bot, "delete_raid_messages", new=AsyncMock(return_value=True)) as posts,
+            patch.object(bot, "remove_all_raid_roles", new=AsyncMock(return_value=[])) as remove,
+        ):
+            await self.run_reminders(now - 1)
+            fetch.assert_not_awaited()
+            self.assertIsNotNone(await bot.fetch_signup(123))
+            await self.run_reminders(now)
+        posts.assert_awaited_once()
         remove.assert_awaited_once()
+        self.assertIsNone(await bot.fetch_signup(123))
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_setup_restores_views_and_close_cancels_owned_scheduler(self):
+    async def test_setup_restores_views_and_close_cancels_both_owned_workers(self):
         client = bot.RosterClient(intents=bot.discord.Intents.none())
         scheduler_started = asyncio.Event()
+        recovery_started = asyncio.Event()
 
         async def scheduler():
             scheduler_started.set()
+            await asyncio.Event().wait()
+
+        async def recovery():
+            recovery_started.set()
             await asyncio.Event().wait()
 
         with (
@@ -326,11 +356,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "fetch_all_raids", new=AsyncMock(return_value=[make_raid()])),
             patch.object(bot.tree, "sync", new=AsyncMock()) as sync,
             patch.object(bot, "reminder_loop", new=scheduler),
+            patch.object(bot, "role_recovery_loop", new=recovery),
             patch.object(bot.discord.Client, "close", new=AsyncMock()) as close,
         ):
             await client.setup_hook()
-            await scheduler_started.wait()
-            task = client.reminder_task
+            await asyncio.wait_for(asyncio.gather(scheduler_started.wait(), recovery_started.wait()), timeout=2)
+            tasks = (client.reminder_task, client.role_recovery_task)
             self.assertEqual(len(client.persistent_views), 1)
             self.assertEqual(client.persistent_views[0].signup_message_id, 123)
             await client.close()
@@ -338,8 +369,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         initialize.assert_awaited_once()
         sync.assert_awaited_once()
         close.assert_awaited_once()
-        self.assertTrue(task.cancelled())
+        self.assertTrue(all(task.cancelled() for task in tasks))
         self.assertIsNone(client.reminder_task)
+        self.assertIsNone(client.role_recovery_task)
         for view in client.persistent_views:
             view.stop()
 
@@ -360,6 +392,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("scheduler failed")
 
         client.reminder_task = asyncio.create_task(failed_scheduler())
+        recovery = asyncio.create_task(asyncio.Event().wait())
+        client.role_recovery_task = recovery
         await asyncio.sleep(0)
         with patch.object(bot.discord.Client, "close", new=AsyncMock()) as close:
             with self.assertRaisesRegex(RuntimeError, "scheduler failed"):
@@ -367,6 +401,26 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         close.assert_awaited_once()
         self.assertIsNone(client.reminder_task)
+        self.assertIsNone(client.role_recovery_task)
+        self.assertTrue(recovery.cancelled())
+
+    async def test_failed_role_worker_does_not_leave_reminder_worker_running_on_close(self):
+        client = bot.RosterClient(intents=bot.discord.Intents.default())
+
+        async def failed_recovery():
+            raise RuntimeError("role recovery failed")
+
+        reminders = asyncio.create_task(asyncio.Event().wait())
+        client.reminder_task = reminders
+        client.role_recovery_task = asyncio.create_task(failed_recovery())
+        await asyncio.sleep(0)
+        with patch.object(bot.discord.Client, "close", new=AsyncMock()) as close:
+            with self.assertRaisesRegex(RuntimeError, "role recovery failed"):
+                await client.close()
+        close.assert_awaited_once()
+        self.assertTrue(reminders.cancelled())
+        self.assertIsNone(client.reminder_task)
+        self.assertIsNone(client.role_recovery_task)
 
     async def test_active_raid_lock_is_shared_and_unused_locks_are_reclaimed(self):
         lock = bot.get_raid_lock(123)

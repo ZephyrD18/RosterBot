@@ -119,6 +119,9 @@ class RoleRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.raid["finished_at"] = 1_000_000
         self.raid["locked"] = True
         await bot.save_raid_state(self.raid)
+        async with bot.aiosqlite.connect(bot.DB_PATH) as db:
+            await db.execute("UPDATE signups SET finished_at = ? WHERE signup_message_id = ?", (1_000_000, 123))
+            await db.commit()
         self.member.remove_roles.side_effect = self.http_error()
         warnings = await bot.queue_raid_role_cleanup(self.guild, self.raid)
         self.assertIn("retry", warnings[0])
@@ -214,6 +217,9 @@ class RoleRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_repair_command_repairs_posts_and_never_adds_roles_to_finished_roster(self):
         self.raid.update(finished_at=1_000_000, locked=True)
         await bot.save_raid_state(self.raid)
+        async with bot.aiosqlite.connect(bot.DB_PATH) as db:
+            await db.execute("UPDATE signups SET finished_at = ? WHERE signup_message_id = ?", (1_000_000, 123))
+            await db.commit()
         event, _ = interaction()
         with (
             patch.object(bot, "repair_raid_messages", new=AsyncMock(return_value=[])) as repair,

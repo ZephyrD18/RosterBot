@@ -1,3 +1,38 @@
+# Standby and cleanup revision — October 26, 2026
+
+Updated the bot to the user's revised signup and cleanup flow:
+
+- Standby now offers multi-select **Tank**, **Healer**, **Melee DPS**, and **Range DPS**. Legacy `DPS` selections expand into both
+  DPS categories. Standby saves category preferences without requiring a single job or mount answer; these are chosen after
+  claiming a main slot. Standby display and mount totals no longer treat unanswered standby job/mount details as incomplete signups.
+- Removed Accept/Decline offers and their callbacks, queue processing, and tests. At five minutes before start, the reminder
+  pings only standby players who match an open, claimable slot; a full or locked roster does not recruit standby. Each eligible
+  player appears once per delivery, including multi-category preferences. Large lists split within Discord's message/mention limits.
+- The final reminder uses static minute wording and no empty-roster fallback or random mount phrase. Its message IDs are saved,
+  deleted at start, and retained for retry after Discord failures or restart. Rescheduling deletes old tracked reminders before
+  committing the new time. Failed multi-message deliveries roll back and retry rather than silently skipping recipients.
+- Reminder timing and role recovery use separate owned background workers. The reminder worker wakes for the nearest raid start;
+  slow role recovery cannot block it. Shutdown cancels and awaits both workers, including when one has failed.
+- Removed auto-finish, duration controls, and `/finishraid`. Roster posts auto-delete **two hours after the scheduled start**,
+  including legacy completed rows. Post deletion precedes marking role cleanup pending; saved membership remains until cleanup
+  succeeds. A deleted channel permits cleanup using the saved server ID, while access/transient failures preserve retry state.
+- Existing unused duration/offer columns are preserved in old databases. Known retired offer-post IDs migrate into tracked
+  cleanup, and the retired offer queue clears. Fresh databases omit those unused fields. No dependency changes were needed.
+
+Verification: **188 tests pass on Python 3.14.9 and Python 3.12**, including standby matching, full-roster suppression, precise
+wakeup, restart deletion, partial send rollback, rescheduling, two-hour cleanup, and background-worker isolation/shutdown.
+Ruff `E9,F,B,ASYNC`, `pip check`, whitespace checks, Python 3.12 syntax parsing, and serialization of all **16 slash commands** pass.
+The existing local database passed a read-only integrity check and retained its original checksum. No live Discord operations
+or hosting-panel changes were performed.
+
+Old final reminders created before message-ID tracking cannot be identified safely from the database; those may need one-time
+manual deletion. Earlier long-window reminders remain visible. Discord outages/permission failures can delay cleanup, and a crash
+between delivery and saving its acknowledgment can still duplicate a notification. Dedicated signup roles remain required.
+
+The dated review below records the previous implementation; its auto-finish and standby-offer behavior is superseded by this revision.
+
+---
+
 # Follow-up review — October 25, 2026
 
 Reviewed the complete bot, all tests, dependency metadata, and run/deployment instructions starting from commit `7c00410`.

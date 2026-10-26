@@ -53,8 +53,8 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
     async def test_abandoned_picker_keeps_saved_roles_unchanged(self):
         await self.save_standby(["Tank"])
         view = self.view(["Tank"])
-        await view.toggle_role(self.event(), "DPS")
-        self.assertEqual(view.roles, ["Tank", "DPS"])
+        await view.toggle_role(self.event(), "Melee DPS")
+        self.assertEqual(view.roles, ["Tank", "Melee DPS"])
         await view.clear_callback(self.event())
         self.assertEqual(view.roles, [])
         view.stop()
@@ -73,21 +73,20 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
         await view.confirm_callback(event)
         self.assertEqual((await bot.fetch_signup(123))["standby"]["42"]["roles"], ["Healer"])
         self.refresh.assert_awaited_once()
-        self.assertEqual(event.followup.send.await_args.args[0], "What job will you play?")
-        self.assertIsInstance(event.followup.send.await_args.kwargs["view"], bot.JobChoiceView)
-        event.followup.send.await_args.kwargs["view"].stop()
+        event.followup.send.assert_not_awaited()
 
     async def test_confirm_preserves_mount_answer_and_copies_roles(self):
         await self.save_standby(["Tank"], needs_mount=False)
         starting_roles = ["Tank"]
         view = self.view(starting_roles)
-        await view.toggle_role(self.event(), "DPS")
+        await view.toggle_role(self.event(), "Melee DPS")
         event = self.event()
         await view.confirm_callback(event)
 
         saved = (await bot.fetch_signup(123))["standby"]["42"]
-        self.assertEqual(saved["roles"], ["Tank", "DPS"])
+        self.assertEqual(saved["roles"], ["Tank", "Melee DPS"])
         self.assertFalse(saved["needs_mount"])
+        self.assertEqual(saved["job"], "Warrior")
         self.assertEqual(starting_roles, ["Tank"])
         self.assertTrue(view.is_finished())
         event.followup.send.assert_not_awaited()
@@ -130,7 +129,7 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_confirmations_commit_once(self):
         await self.save_standby(["Tank"])
-        view = self.view(["Tank", "DPS"])
+        view = self.view(["Tank", "Melee DPS"])
         first, second = self.event(), self.event()
         with patch.object(bot, "save_raid_state", wraps=bot.save_raid_state) as save:
             await asyncio.gather(view.confirm_callback(first), view.confirm_callback(second))
@@ -147,8 +146,8 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
 
         picker = event.followup.send.await_args.kwargs["view"]
         self.views.append(picker)
-        self.assertEqual(picker.roles, ["DPS", "Healer"])
-        self.assertIn("DPS/Healer", event.followup.send.await_args.args[0])
+        self.assertEqual(picker.roles, ["Healer", "Melee DPS", "Range DPS"])
+        self.assertIn("Healer/Melee DPS/Range DPS", event.followup.send.await_args.args[0])
 
     async def test_closed_picker_cannot_commit_changes(self):
         view = self.view(["Tank"])
@@ -161,9 +160,30 @@ class StandbyTests(unittest.IsolatedAsyncioTestCase):
     async def test_picker_rejects_another_user(self):
         view = self.view(["Tank"])
         event = self.event(99)
-        await view.toggle_role(event, "DPS")
+        await view.toggle_role(event, "Melee DPS")
         await view.clear_callback(event)
         await view.confirm_callback(event)
         self.assertEqual(view.roles, ["Tank"])
         self.assertEqual(event.response.send_message.await_count, 3)
         self.assertEqual((await bot.fetch_signup(123))["standby"], {})
+
+    async def test_all_four_categories_can_be_selected_and_saved_together(self):
+        view = self.view()
+        event = self.event()
+        for category in bot.STANDBY_CHOICES:
+            await view.toggle_role(event, category)
+        category_buttons = [button for button in view.children if button.label in bot.STANDBY_CHOICES]
+        self.assertEqual([button.label for button in category_buttons], ["Tank", "Healer", "Melee DPS", "Range DPS"])
+        self.assertTrue(all(button.style == bot.discord.ButtonStyle.primary for button in category_buttons))
+        await view.confirm_callback(event)
+        saved = (await bot.fetch_signup(123))["standby"]["42"]
+        self.assertEqual(saved["roles"], bot.STANDBY_CHOICES)
+        self.assertIsNone(saved["job"])
+        event.followup.send.assert_not_awaited()
+
+    async def test_invalid_category_cannot_be_added_to_draft(self):
+        view = self.view(["Tank"])
+        event = self.event()
+        await view.toggle_role(event, "Invalid role")
+        self.assertEqual(view.roles, ["Tank"])
+        self.assertIn("available standby categories", event.followup.send.await_args.args[0])
