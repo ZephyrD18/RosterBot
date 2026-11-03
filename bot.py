@@ -3331,6 +3331,9 @@ async def readycheck(interaction: discord.Interaction, signup_message_id: str | 
 
 # --- Reminders and cleanup ---
 
+MISSED_REMINDER_WARNING = "Skipped a due reminder for %s because the raid started before it could be sent"
+
+
 def reminder_work_due(raid: dict, now: int) -> bool:
     scheduled_at = raid.get("scheduled_at")
     if raid.get("cleanup_pending") or (scheduled_at is not None and now >= scheduled_at + RAID_CLEANUP_SECONDS):
@@ -3355,6 +3358,11 @@ async def send_due_reminders():
     snapshots = await fetch_scheduled_raids(now)
     future_starts = [raid["scheduled_at"] for raid in snapshots
                      if raid.get("scheduled_at") is not None and raid["scheduled_at"] > now]
+    # Reminders have deadlines; cleanup and start-time deletions can wait behind them.
+    snapshots.sort(key=lambda raid: (
+        bool(raid.get("cleanup_pending")) or (raid.get("scheduled_at") or 0) <= now,
+        raid.get("scheduled_at") or 0,
+    ))
     for snapshot in snapshots:
         try:
             now = int(datetime.now(timezone.utc).timestamp())
@@ -3438,6 +3446,7 @@ async def process_due_raid(signup_message_id: int):
         # Lock contention and Discord requests can cross a reminder deadline.
         now = int(datetime.now(timezone.utc).timestamp())
         if now >= scheduled_at:
+            logger.warning(MISSED_REMINDER_WARNING, signup_message_id)
             return
 
         five_minute_due = (
@@ -3453,6 +3462,7 @@ async def process_due_raid(signup_message_id: int):
                 for index, standby_players in enumerate(start_reminder_batches(raid, now)):
                     send_now = int(datetime.now(timezone.utc).timestamp())
                     if send_now >= scheduled_at:
+                        logger.warning(MISSED_REMINDER_WARNING, signup_message_id)
                         send_failed = True
                         break
                     created_messages.append(await channel.send(

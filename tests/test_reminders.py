@@ -362,6 +362,63 @@ class StartReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.channel.messages[1000].deleted)
         self.assertEqual((await bot.fetch_signup(123))["start_reminder_message_ids"], [])
 
+    async def test_upcoming_reminders_run_before_cleanup_work(self):
+        await bot.insert_raid(self.raid(scheduled_at=self.now - 3 * 60 * 60) | {"signup_message_id": 111})
+        await bot.insert_raid(self.raid(scheduled_at=self.now + 200) | {"signup_message_id": 222})
+        order = []
+        with (
+            patch.object(bot, "datetime") as clock,
+            patch.object(bot, "process_due_raid", new=AsyncMock(side_effect=order.append)),
+        ):
+            clock.now.return_value = datetime.fromtimestamp(self.now, timezone.utc)
+            await bot.send_due_reminders()
+        self.assertEqual(order, [222, 111])
+
+    def moving_clock(self, clock, current):
+        clock.now.side_effect = lambda tz=None: datetime.fromtimestamp(current[0], timezone.utc)
+
+    async def test_reminder_delayed_past_the_start_is_logged(self):
+        await bot.insert_raid(self.raid(scheduled_at=self.now + 100))
+        current = [self.now]
+
+        async def slow_channel(*args, **kwargs):
+            current[0] = self.now + 101
+            return self.channel
+
+        with (
+            patch.object(bot, "datetime") as clock,
+            patch.object(bot, "fetch_raid_channel", new=AsyncMock(side_effect=slow_channel)),
+            self.assertLogs("rosterbot", level="WARNING") as logs,
+        ):
+            self.moving_clock(clock, current)
+            await bot.process_due_raid(123)
+        self.assertEqual(self.channel.sent, [])
+        self.assertIn("started before it could be sent", logs.output[0])
+
+    async def test_start_reminder_batches_that_cross_the_start_are_logged(self):
+        raid = self.raid(scheduled_at=self.now + 100)
+        self.fill_except(raid, {"MT"})
+        raid["standby"] = {str(500 + index): player(500 + index, ["Tank"]) for index in range(100)}
+        await bot.insert_raid(raid)
+        current = [self.now]
+        original_send = self.channel.send
+
+        async def send(content=None, **kwargs):
+            message = await original_send(content, **kwargs)
+            current[0] = self.now + 101
+            return message
+
+        with (
+            patch.object(bot, "datetime") as clock,
+            patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=self.channel)),
+            patch.object(self.channel, "send", new=send),
+            self.assertLogs("rosterbot", level="WARNING") as logs,
+        ):
+            self.moving_clock(clock, current)
+            await bot.process_due_raid(123)
+        self.assertTrue(self.channel.messages[1000].deleted)
+        self.assertIn("started before it could be sent", "\n".join(logs.output))
+
     async def test_scheduler_returns_the_upcoming_start_for_precise_cleanup_wakeup(self):
         raid = self.raid(scheduled_at=self.now + 12)
         await bot.insert_raid(raid)
