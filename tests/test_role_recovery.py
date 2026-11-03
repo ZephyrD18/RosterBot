@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -232,6 +233,97 @@ class RoleRecoveryTests(unittest.IsolatedAsyncioTestCase):
         cleanup.assert_awaited_once()
         add.assert_not_awaited()
         self.assertIn("Repairs are complete", event.followup.send.await_args.args[0])
+
+    async def retry_due(self, at, *, guild=None, ready=False):
+        with (
+            patch.object(bot.bot, "get_guild", return_value=guild),
+            patch.object(bot.bot, "is_ready", return_value=ready),
+            patch.object(bot, "datetime") as clock,
+        ):
+            clock.now.return_value = datetime.fromtimestamp(at, timezone.utc)
+            return await bot.retry_pending_role_updates(due_at=at)
+
+    def test_retry_delay_doubles_up_to_six_hours(self):
+        self.assertEqual([bot.retry_delay(attempts) for attempts in (1, 2, 3)], [60, 120, 240])
+        self.assertEqual(bot.retry_delay(50), 6 * 60 * 60)
+
+    async def test_failing_background_retry_waits_for_its_backoff(self):
+        await bot.queue_role_update(1, 42, 10, "Raid", "add", "Joined raid")
+        self.member.add_roles.side_effect = self.http_error()
+        await self.retry_due(1_000_000, guild=self.guild)
+        self.assertEqual((await self.pending())[0]["next_attempt_at"], 1_000_060)
+        await self.retry_due(1_000_059, guild=self.guild)
+        self.assertEqual(self.member.add_roles.await_count, 1)
+        await self.retry_due(1_000_060, guild=self.guild)
+        self.assertEqual(self.member.add_roles.await_count, 2)
+        saved = (await self.pending())[0]
+        self.assertEqual((saved["attempts"], saved["next_attempt_at"], saved["failing_since"]), (2, 1_000_180, 1_000_000))
+
+    async def test_manual_retry_ignores_backoff(self):
+        await bot.queue_role_update(1, 42, 10, "Raid", "add", "Joined raid")
+        self.member.add_roles.side_effect = self.http_error()
+        await self.retry_due(1_000_000, guild=self.guild)
+        self.member.add_roles.side_effect = None
+        self.assertEqual(await self.retry(), [])
+        self.assertEqual(self.member.add_roles.await_count, 2)
+        self.assertEqual(await self.pending(), [])
+
+    async def test_new_failure_restarts_backoff(self):
+        await bot.queue_role_update(1, 42, 10, "Raid", "add", "Joined raid")
+        self.member.add_roles.side_effect = self.http_error()
+        await self.retry_due(1_000_000, guild=self.guild)
+        await bot.queue_role_update(1, 42, 10, "Raid", "remove", "Left raid")
+        saved = (await self.pending())[0]
+        self.assertEqual((saved["attempts"], saved["next_attempt_at"], saved["failing_since"]), (0, 0, None))
+
+    async def test_departed_server_updates_expire_after_a_week_without_access(self):
+        week = 7 * 24 * 60 * 60
+        await bot.queue_role_update(1, 42, 10, "Raid", "add", "Joined raid")
+        warnings = await self.retry_due(1_000_000, ready=True)
+        self.assertIn("cannot access", warnings[0])
+        await self.retry_due(1_000_000 + week - 1000, ready=True)
+        self.assertEqual(len(await self.pending()), 1)
+        with self.assertLogs("rosterbot", level="INFO") as logs:
+            await self.retry_due(1_000_000 + week + 1000, ready=True)
+        self.assertEqual(await self.pending(), [])
+        self.assertIn("server 1", logs.output[0])
+
+    async def test_existing_queue_gains_backoff_columns_without_losing_updates(self):
+        async with aiosqlite.connect(bot.DB_PATH) as db:
+            await db.execute("DROP TABLE role_retries")
+            await db.execute(
+                """
+                CREATE TABLE role_retries (
+                    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role_id INTEGER NOT NULL,
+                    role_name TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL,
+                    replacement_role_id INTEGER, PRIMARY KEY (guild_id, user_id, role_id)
+                )
+                """
+            )
+            await db.execute("INSERT INTO role_retries VALUES (1, 42, 10, 'Raid', 'add', 'Joined raid', NULL)")
+            await db.commit()
+        await bot.init_db()
+        saved = await self.pending()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual((saved[0]["action"], saved[0]["attempts"], saved[0]["next_attempt_at"]), ("add", 0, 0))
+
+    async def test_background_loop_retries_only_due_updates(self):
+        with (
+            patch.object(bot.bot, "wait_until_ready", new=AsyncMock()),
+            patch.object(bot.bot, "is_closed", side_effect=[False, True]),
+            patch.object(bot, "retry_pending_role_updates", new=AsyncMock(return_value=[])) as retry,
+            patch.object(bot, "datetime") as clock,
+            patch.object(bot.asyncio, "sleep", new=AsyncMock()),
+        ):
+            clock.now.return_value = datetime.fromtimestamp(1_000_000, timezone.utc)
+            await bot.role_recovery_loop()
+        retry.assert_awaited_once_with(due_at=1_000_000)
+
+    async def test_disconnected_bot_never_expires_saved_updates(self):
+        await bot.queue_role_update(1, 42, 10, "Raid", "add", "Joined raid")
+        for at in (1_000_000, 1_000_000 + 30 * 24 * 60 * 60):
+            await self.retry_due(at, ready=False)
+        self.assertEqual(len(await self.pending()), 1)
 
     async def test_repair_command_requires_manager_permissions(self):
         event, _ = interaction()

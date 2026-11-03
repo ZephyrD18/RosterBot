@@ -393,7 +393,7 @@ class StartReminderTests(unittest.IsolatedAsyncioTestCase):
         recovery_started = asyncio.Event()
         release_recovery = asyncio.Event()
 
-        async def blocked_recovery():
+        async def blocked_recovery(**_):
             recovery_started.set()
             await release_recovery.wait()
             return []

@@ -150,6 +150,8 @@ REMINDER_WINDOWS = [
 FIVE_MINUTE_REMINDER_SECONDS = 5 * 60
 REMINDER_SELECTION_GRACE_SECONDS = 60
 RAID_CLEANUP_SECONDS = 2 * 60 * 60
+RETRY_BACKOFF_MAX_SECONDS = 6 * 60 * 60
+DEPARTED_SERVER_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 # --- Saved data and text helpers ---
@@ -498,6 +500,15 @@ def get_role_lock(user_id: int, role_id: int) -> asyncio.Lock:
     return lock
 
 
+def retry_delay(attempts: int) -> int:
+    return min(60 * 2 ** (max(attempts, 1) - 1), RETRY_BACKOFF_MAX_SECONDS)
+
+
+def bot_left_guild(guild_id: int | None) -> bool:
+    # The guild cache only proves membership while the Gateway session is ready.
+    return bool(guild_id) and bot.is_ready() and bot.get_guild(guild_id) is None
+
+
 async def member_needs_raid_role(guild, user_id: int, role, *, excluding: int | None = None) -> bool | None:
     for raid in await fetch_raids_for_role(role.id, role.name):
         if raid["signup_message_id"] == excluding or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
@@ -530,10 +541,22 @@ async def init_role_recovery_db(db):
             action TEXT NOT NULL CHECK(action IN ('add', 'remove')),
             reason TEXT NOT NULL,
             replacement_role_id INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            failing_since INTEGER,
             PRIMARY KEY (guild_id, user_id, role_id)
         )
         """
     )
+    async with db.execute("PRAGMA table_info(role_retries)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    for column_name, column_type in (
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("failing_since", "INTEGER"),
+    ):
+        if column_name not in columns:
+            await db.execute(f"ALTER TABLE role_retries ADD COLUMN {column_name} {column_type}")
 
 
 async def save_role_update(guild_id: int, user_id: int, role_id: int, role_name: str, action: str, reason: str, *, replacement_role_id=None):
@@ -545,7 +568,8 @@ async def save_role_update(guild_id: int, user_id: int, role_id: int, role_name:
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (guild_id, user_id, role_id) DO UPDATE SET
                 role_name = excluded.role_name, action = excluded.action, reason = excluded.reason,
-                replacement_role_id = excluded.replacement_role_id
+                replacement_role_id = excluded.replacement_role_id,
+                attempts = 0, next_attempt_at = 0, failing_since = NULL
             """,
             (guild_id, user_id, role_id, role_name, action, reason[:512], replacement_role_id),
         )
@@ -568,12 +592,16 @@ async def queue_role_change(guild, user_id: int, role, old_role, raid: dict):
         )
 
 
-async def retry_pending_role_updates(guild_id: int | None = None) -> list[str]:
+async def retry_pending_role_updates(guild_id: int | None = None, *, due_at: int | None = None) -> list[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM role_retries WHERE (? IS NULL OR guild_id = ?) ORDER BY action, role_id",
-            (guild_id, guild_id),
+            """
+            SELECT * FROM role_retries
+            WHERE (? IS NULL OR guild_id = ?) AND (? IS NULL OR next_attempt_at <= ?)
+            ORDER BY action, role_id
+            """,
+            (guild_id, guild_id, due_at, due_at),
         ) as cursor:
             pending = [dict(row) for row in await cursor.fetchall()]
     warnings = []
@@ -584,6 +612,8 @@ async def retry_pending_role_updates(guild_id: int | None = None) -> list[str]:
                 warnings.append(warning)
         except Exception:
             logger.exception("Role retry failed for member %s role %s", update["user_id"], update["role_id"])
+            async with get_role_lock(update["user_id"], update["role_id"]):
+                await defer_role_update(update)
             warning = "One or more role updates remain saved for another attempt."
             if warning not in warnings:
                 warnings.append(warning)
@@ -591,52 +621,86 @@ async def retry_pending_role_updates(guild_id: int | None = None) -> list[str]:
 
 
 async def retry_role_update(update: dict) -> str | None:
+    async with get_role_lock(update["user_id"], update["role_id"]):
+        warning = await apply_role_update(update)
+        if warning:
+            await defer_role_update(update)
+    return warning
+
+
+async def defer_role_update(update: dict) -> None:
+    # Callers hold the member/role lock.
+    now = int(datetime.now(timezone.utc).timestamp())
+    key = (update["guild_id"], update["user_id"], update["role_id"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT attempts, failing_since FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return
+        failing_since = row[1] or now
+        if bot_left_guild(update["guild_id"]) and now - failing_since >= DEPARTED_SERVER_RETENTION_SECONDS:
+            await db.execute("DELETE FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key)
+            logger.info("Dropped a saved role update for server %s after a week without access", update["guild_id"])
+        else:
+            attempts = row[0] + 1
+            await db.execute(
+                """
+                UPDATE role_retries SET attempts = ?, next_attempt_at = ?, failing_since = ?
+                WHERE guild_id = ? AND user_id = ? AND role_id = ?
+                """,
+                (attempts, now + retry_delay(attempts), failing_since, *key),
+            )
+        await db.commit()
+
+
+async def apply_role_update(update: dict) -> str | None:
     guild = bot.get_guild(update["guild_id"])
     if guild is None:
         return "Role updates remain saved because I cannot access the server."
-    async with get_role_lock(update["user_id"], update["role_id"]):
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            key = (update["guild_id"], update["user_id"], update["role_id"])
-            async with db.execute(
-                "SELECT * FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
-            ) as cursor:
-                current = await cursor.fetchone()
-            if current is None:
-                return None
-            update = dict(current)
-            role = guild.get_role(update["role_id"])
-            if role is not None:
-                warning = raid_role_safety_error(role)
-                if warning:
-                    return f"A server manager must review a pending role update. {warning}"
-                needed = await member_needs_raid_role(guild, update["user_id"], role)
-                if needed is None:
-                    return "A role update is waiting until another saved roster can be verified."
-                replacement_id = update["replacement_role_id"]
-                if not needed and replacement_id:
-                    replacement = guild.get_role(replacement_id)
-                    replacement_needed = await member_needs_raid_role(guild, update["user_id"], replacement) if replacement else False
-                    if replacement_needed is None:
-                        return "Old role cleanup is waiting until the replacement roster can be verified."
-                    if replacement_needed:
-                        async with db.execute(
-                            "SELECT 1 FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?",
-                            (guild.id, update["user_id"], replacement_id),
-                        ) as cursor:
-                            if await cursor.fetchone():
-                                return "Old role cleanup is waiting for the replacement role assignment."
-                try:
-                    member = await fetch_guild_member(guild, update["user_id"])
-                    if member is not None:
-                        action = member.add_roles if needed else member.remove_roles
-                        await action(role, reason=update["reason"])
-                except discord.HTTPException:
-                    return "Discord could not complete a saved role update; it will retry automatically."
-            await db.execute(
-                "DELETE FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
-            )
-            await db.commit()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        key = (update["guild_id"], update["user_id"], update["role_id"])
+        async with db.execute(
+            "SELECT * FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
+        ) as cursor:
+            current = await cursor.fetchone()
+        if current is None:
+            return None
+        update = dict(current)
+        role = guild.get_role(update["role_id"])
+        if role is not None:
+            warning = raid_role_safety_error(role)
+            if warning:
+                return f"A server manager must review a pending role update. {warning}"
+            needed = await member_needs_raid_role(guild, update["user_id"], role)
+            if needed is None:
+                return "A role update is waiting until another saved roster can be verified."
+            replacement_id = update["replacement_role_id"]
+            if not needed and replacement_id:
+                replacement = guild.get_role(replacement_id)
+                replacement_needed = await member_needs_raid_role(guild, update["user_id"], replacement) if replacement else False
+                if replacement_needed is None:
+                    return "Old role cleanup is waiting until the replacement roster can be verified."
+                if replacement_needed:
+                    async with db.execute(
+                        "SELECT 1 FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?",
+                        (guild.id, update["user_id"], replacement_id),
+                    ) as cursor:
+                        if await cursor.fetchone():
+                            return "Old role cleanup is waiting for the replacement role assignment."
+            try:
+                member = await fetch_guild_member(guild, update["user_id"])
+                if member is not None:
+                    action = member.add_roles if needed else member.remove_roles
+                    await action(role, reason=update["reason"])
+            except discord.HTTPException:
+                return "Discord could not complete a saved role update; it will retry automatically."
+        await db.execute(
+            "DELETE FROM role_retries WHERE guild_id = ? AND user_id = ? AND role_id = ?", key,
+        )
+        await db.commit()
     return None
 
 
@@ -3423,7 +3487,7 @@ async def role_recovery_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            for warning in await retry_pending_role_updates():
+            for warning in await retry_pending_role_updates(due_at=int(datetime.now(timezone.utc).timestamp())):
                 logger.warning("Role recovery: %s", warning)
         except Exception:
             logger.exception("Role recovery check failed")
