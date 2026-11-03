@@ -22,6 +22,7 @@ class RosterClient(discord.Client):
 
     async def setup_hook(self):
         await init_db()
+        self.add_dynamic_items(LegacyStandbyChoice)
         for raid in await fetch_all_raids():
             self.add_view(RaidSignupView(raid), message_id=raid["signup_message_id"])
         await tree.sync()
@@ -750,6 +751,10 @@ def start_reminder_batches(raid: dict, now: int) -> list[list[dict]]:
     return [*batches, current]
 
 
+def is_expired_interaction(error: Exception) -> bool:
+    return isinstance(error, discord.HTTPException) and error.status == 404 and error.code == 10062
+
+
 class ErrorHandledView(discord.ui.View):
     async def on_error(
         self,
@@ -757,9 +762,13 @@ class ErrorHandledView(discord.ui.View):
         error: Exception,
         item: discord.ui.Item,
     ) -> None:
+        item_name = getattr(item, "custom_id", type(item).__name__)
+        if is_expired_interaction(error):
+            logger.warning("Expired component interaction for %s (10062); response skipped", item_name)
+            return
         logger.error(
             "Component interaction failed for %s",
-            getattr(item, "custom_id", type(item).__name__),
+            item_name,
             exc_info=(type(error), error, error.__traceback__),
         )
         message = "Something went wrong while updating the roster. Please try again."
@@ -768,8 +777,8 @@ class ErrorHandledView(discord.ui.View):
                 await interaction.followup.send(message, ephemeral=True)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
-        except discord.HTTPException:
-            logger.exception("Could not report a component interaction error")
+        except Exception as report_error:
+            logger.warning("Could not report a component interaction error: %s", type(report_error).__name__)
 
 
 def require_roster_manager(interaction: discord.Interaction) -> tuple[bool, str | None]:
@@ -1914,8 +1923,51 @@ def standby_panel_text(raid: dict, roles: list[str]) -> str:
     return (
         f"Standby roles for **{raid_title(raid)}**: **{selected}**\n"
         "Toggle any roles you can cover, then press **Confirm Standby** to save. "
-        "Confirm with no roles selected to leave standby. Closing this picker keeps your saved roles unchanged."
+        "Confirm with no roles selected to leave standby. This picker expires after 5 minutes without a click; "
+        "closing it or letting it expire keeps your saved roles unchanged."
     )
+
+
+class LegacyStandbyChoice(discord.ui.DynamicItem[discord.ui.Button], template=r"standby:(?P<signup_id>[0-9]{1,19}):(?P<user_id>[0-9]{1,20}):DPS"):
+    def __init__(self, signup_message_id: int, user_id: int):
+        super().__init__(discord.ui.Button(label="DPS", custom_id=f"standby:{signup_message_id}:{user_id}:DPS"))
+        self.signup_message_id = signup_message_id
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["signup_id"]), int(match["user_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This standby picker is not yours.", ephemeral=True)
+            return
+        picker = StandbyRoleView(self.signup_message_id, self.user_id)
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            if not 0 < self.signup_message_id < 2**63 or not 0 < self.user_id < 2**64:
+                picker.stop()
+                await interaction.followup.send("This older standby picker is invalid. Open Standby again on the roster.", ephemeral=True)
+                return
+            async with get_raid_lock(self.signup_message_id):
+                raid = await picker.fetch_editable_raid(interaction)
+                if raid is None:
+                    picker.stop()
+                    return
+                if raid.get("channel_id") != interaction.channel_id:
+                    picker.stop()
+                    await interaction.followup.send("This standby picker belongs to a different channel.", ephemeral=True)
+                    return
+                entry = raid["standby"].get(str(self.user_id))
+                picker.roles = normalize_standby_roles(entry["roles"] if entry else [])
+                picker.update_selection_styles()
+            picker.message = await interaction.edit_original_response(
+                content="This older picker has been refreshed from your saved choices.\n" + standby_panel_text(raid, picker.roles),
+                view=picker,
+            )
+        except Exception as error:
+            picker.stop()
+            await picker.on_error(interaction, error, self)
 
 
 class StandbyRoleView(ErrorHandledView):
@@ -1923,10 +1975,25 @@ class StandbyRoleView(ErrorHandledView):
         super().__init__(timeout=300)
         self.signup_message_id = signup_message_id
         self.user_id = user_id
+        self.message: discord.WebhookMessage | discord.InteractionMessage | None = None
         self.roles = normalize_standby_roles(roles or [])
         self.add_role_buttons()
         self.add_confirm_button()
         self.add_clear_button()
+
+    async def on_timeout(self):
+        self.stop()
+        async with get_raid_lock(self.signup_message_id):
+            message, self.message = self.message, None
+        if message is None:
+            return
+        try:
+            await message.edit(
+                content="This standby picker expired. Open Standby again on the roster. Your saved choices are unchanged.",
+                view=None,
+            )
+        except discord.HTTPException:
+            logger.exception("Could not close expired standby picker for roster %s", self.signup_message_id)
 
     def add_role_buttons(self):
         for role_name in STANDBY_CHOICES:
@@ -2002,7 +2069,7 @@ class StandbyRoleView(ErrorHandledView):
             else:
                 self.roles.append(role_name)
             self.update_selection_styles()
-            await interaction.edit_original_response(content=standby_panel_text(raid, self.roles), view=self)
+            self.message = await interaction.edit_original_response(content=standby_panel_text(raid, self.roles), view=self)
 
     async def confirm_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -2032,6 +2099,7 @@ class StandbyRoleView(ErrorHandledView):
             refreshed = True
             if entry or saved_entry:
                 refreshed = await update_raid_messages(interaction.channel, raid)
+            self.message = None
             self.stop()
 
         message = f"Standby roles confirmed: **{standby_role_text(entry['roles'])}**." if entry else "Standby cleared."
@@ -2051,7 +2119,7 @@ class StandbyRoleView(ErrorHandledView):
                 return
             self.roles.clear()
             self.update_selection_styles()
-            await interaction.edit_original_response(content=standby_panel_text(raid, self.roles), view=self)
+            self.message = await interaction.edit_original_response(content=standby_panel_text(raid, self.roles), view=self)
 
 
     def update_selection_styles(self):
@@ -2293,10 +2361,11 @@ class RaidSignupView(ErrorHandledView):
 
         entry = raid["standby"].get(str(interaction.user.id))
         view = StandbyRoleView(self.signup_message_id, interaction.user.id, entry["roles"] if entry else [])
-        await interaction.followup.send(
+        view.message = await interaction.followup.send(
             standby_panel_text(raid, view.roles),
             view=view,
             ephemeral=True,
+            wait=True,
         )
 
     async def resign_callback(self, interaction: discord.Interaction):
@@ -3372,9 +3441,13 @@ async def reminder_loop():
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     original = error.original if isinstance(error, app_commands.CommandInvokeError) else error
+    command_name = interaction.command.name if interaction.command else "unknown"
+    if is_expired_interaction(original):
+        logger.warning("Expired command interaction for %s (10062); response skipped", command_name)
+        return
     logger.error(
         "Application command failed: %s",
-        interaction.command.name if interaction.command else "unknown",
+        command_name,
         exc_info=(type(original), original, original.__traceback__),
     )
 
@@ -3388,8 +3461,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
-    except discord.HTTPException:
-        logger.exception("Could not report an application command error")
+    except Exception as report_error:
+        logger.warning("Could not report an application command error: %s", type(report_error).__name__)
 
 
 @bot.event
