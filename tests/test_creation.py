@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 
 import bot
+from test_bot import DISTANT_DATE, FUTURE_DATE
 
 
 class CreationTests(unittest.IsolatedAsyncioTestCase):
@@ -56,7 +57,7 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(bot, "save_raid_state", side_effect=setup_save):
             creation = asyncio.create_task(bot.create_raid(
-                self.interaction, "Test raid", "12/31/2099", "8PM", send_announcement=True,
+                self.interaction, "Test raid", FUTURE_DATE, "8PM", send_announcement=True,
             ))
             await asyncio.wait_for(setup_paused.wait(), timeout=2)
             manager = asyncio.create_task(lock_roster())
@@ -70,10 +71,15 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await bot.fetch_signup(123))["locked"])
         self.messages[0].edit.assert_awaited_once()
 
+    async def test_dates_more_than_a_year_ahead_are_rejected_before_posting(self):
+        await bot.create_raid(self.interaction, "Test raid", DISTANT_DATE, "8PM")
+        self.interaction.channel.send.assert_not_awaited()
+        self.assertIn("within the next year", self.interaction.followup.send.await_args.args[0])
+
     async def test_insert_failure_removes_the_unsaved_signup(self):
         with patch.object(bot, "insert_raid", side_effect=aiosqlite.OperationalError("Test failure")):
             with self.assertLogs("rosterbot", level="ERROR"):
-                await bot.create_raid(self.interaction, "Test raid", "12/31/2099", "8PM")
+                await bot.create_raid(self.interaction, "Test raid", FUTURE_DATE, "8PM")
 
         self.messages[0].delete.assert_awaited_once()
         self.assertIsNone(await bot.fetch_signup(123))
@@ -83,7 +89,7 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(status=500, reason="Unavailable")
         self.messages[0].edit.side_effect = bot.discord.HTTPException(response, "Unavailable")
         with self.assertLogs("rosterbot", level="ERROR"):
-            await bot.create_raid(self.interaction, "Test raid", "12/31/2099", "8PM")
+            await bot.create_raid(self.interaction, "Test raid", FUTURE_DATE, "8PM")
         self.messages[0].delete.assert_not_awaited()
         self.assertIsNotNone(await bot.fetch_signup(123))
         self.assertIn("could not activate", self.interaction.followup.send.await_args.args[0])
@@ -102,7 +108,7 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "save_raid_state", side_effect=fail_first_save):
             with self.assertLogs("rosterbot", level="ERROR"):
                 await bot.create_raid(
-                    self.interaction, "Test raid", "12/31/2099", "8PM", send_announcement=True,
+                    self.interaction, "Test raid", FUTURE_DATE, "8PM", send_announcement=True,
                 )
 
         raid = await bot.fetch_signup(123)

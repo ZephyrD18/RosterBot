@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiosqlite
 
 import bot
-from test_bot import sample_raid
+from test_bot import DISTANT_DATE, FUTURE_DATE, sample_raid
 from test_interactions import interaction
 
 
@@ -48,9 +48,9 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         self.raid["reminders_sent"] = {"automatic": True, "five_minute": True}
         await bot.save_raid_state(self.raid)
         with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)):
-            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM")
+            await bot.editraid.callback(self.event, date=FUTURE_DATE, time="8PM")
         saved = await bot.fetch_signup(123)
-        self.assertEqual(saved["scheduled_at"], bot.parse_raid_datetime("12/31/2099", "8PM", "PT"))
+        self.assertEqual(saved["scheduled_at"], bot.parse_raid_datetime(FUTURE_DATE, "8PM", "PT"))
         self.assertEqual(saved["signups"]["MT"]["job"], "Warrior")
         self.assertFalse(saved["signups"]["MT"]["needs_mount"])
         self.assertIsNone(saved["signups"]["MT"]["ready_status"])
@@ -80,13 +80,13 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(delete=AsyncMock())
         self.event.channel.get_partial_message = Mock(return_value=message)
         with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)):
-            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM")
+            await bot.editraid.callback(self.event, date=FUTURE_DATE, time="8PM")
         message.delete.assert_awaited_once()
         self.event.channel.get_partial_message.assert_called_once_with(555)
         saved = await bot.fetch_signup(123)
         self.assertEqual(saved["start_reminder_message_ids"], [])
         self.assertEqual(saved["reminders_sent"], {})
-        self.assertEqual(saved["scheduled_at"], bot.parse_raid_datetime("12/31/2099", "8PM", "PT"))
+        self.assertEqual(saved["scheduled_at"], bot.parse_raid_datetime(FUTURE_DATE, "8PM", "PT"))
 
     async def test_failed_old_reminder_cleanup_preserves_schedule_and_reminder_flags(self):
         self.raid["start_reminder_message_ids"] = [555]
@@ -96,7 +96,7 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "delete_start_reminders", new=AsyncMock(return_value=False)) as cleanup,
             patch.object(bot, "update_raid_messages", new=AsyncMock()) as refresh,
         ):
-            await bot.editraid.callback(self.event, date="12/31/2099", time="8PM")
+            await bot.editraid.callback(self.event, date=FUTURE_DATE, time="8PM")
         cleanup.assert_awaited_once()
         refresh.assert_not_awaited()
         self.event.channel.send.assert_not_awaited()
@@ -109,8 +109,9 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_edits_do_not_change_saved_raid(self):
         for arguments, expected in (
-            ({"date": "12/31/2099"}, "both date and time"),
+            ({"date": FUTURE_DATE}, "both date and time"),
             ({"date": "1/1/2000", "time": "8PM"}, "future"),
+            ({"date": DISTANT_DATE, "time": "8PM"}, "within the next year"),
             ({"raid_name": " "}, "cannot be blank"),
         ):
             with self.subTest(arguments=arguments):

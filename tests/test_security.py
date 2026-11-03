@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import discord
 
 import bot
+from test_bot import FUTURE_DATE
 
 
 def make_role(guild, role_id=10, name="Raid", *, mentionable=False, **permissions):
@@ -113,7 +114,7 @@ class NotificationSecurityTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "insert_raid", new=AsyncMock()) as insert, \
              patch.object(bot, "save_raid_state", new=AsyncMock()):
             await bot.create_raid(
-                self.event, "Test raid", "12/31/2099", "8PM",
+                self.event, "Test raid", FUTURE_DATE, "8PM",
                 notify_role=None if default_role else self.role, send_announcement=True,
             )
         return insert

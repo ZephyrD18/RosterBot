@@ -25,7 +25,10 @@ class RosterClient(discord.Client):
         self.add_dynamic_items(LegacyStandbyChoice)
         for raid in await fetch_all_raids():
             self.add_view(RaidSignupView(raid), message_id=raid["signup_message_id"])
-        await tree.sync()
+        try:
+            await tree.sync()
+        except discord.HTTPException:
+            logger.exception("Could not sync slash commands; previously registered commands remain available")
         self.reminder_task = asyncio.create_task(reminder_loop(), name="raid-reminders")
         self.role_recovery_task = asyncio.create_task(role_recovery_loop(), name="raid-role-recovery")
 
@@ -48,11 +51,17 @@ intents = discord.Intents(guilds=True)
 bot = RosterClient(intents=intents, allowed_mentions=discord.AllowedMentions.none())
 tree = app_commands.CommandTree(bot)
 
+def resolve_log_level(name: str | None) -> int:
+    return logging.getLevelNamesMapping().get((name or "INFO").upper(), logging.INFO)
+
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=resolve_log_level(os.getenv("LOG_LEVEL")),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("rosterbot")
+if os.getenv("LOG_LEVEL", "INFO").upper() not in logging.getLevelNamesMapping():
+    logger.warning("Unknown LOG_LEVEL %r; using INFO", os.getenv("LOG_LEVEL"))
 
 DB_PATH = str(Path(os.getenv("ROSTERBOT_DB_PATH", "raids.db")).expanduser())
 raid_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
@@ -150,6 +159,8 @@ REMINDER_WINDOWS = [
 FIVE_MINUTE_REMINDER_SECONDS = 5 * 60
 REMINDER_SELECTION_GRACE_SECONDS = 60
 RAID_CLEANUP_SECONDS = 2 * 60 * 60
+MAX_SCHEDULE_AHEAD_SECONDS = 366 * 24 * 60 * 60
+DISTANT_SCHEDULE_ERROR = "Choose a raid time within the next year."
 RETRY_BACKOFF_MAX_SECONDS = 6 * 60 * 60
 DEPARTED_SERVER_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
@@ -842,7 +853,7 @@ class ErrorHandledView(discord.ui.View):
             else:
                 await interaction.response.send_message(message, ephemeral=True)
         except Exception as report_error:
-            logger.warning("Could not report a component interaction error: %s", type(report_error).__name__)
+            logger.warning("Could not report a component interaction error: %r", report_error)
 
 
 def require_roster_manager(interaction: discord.Interaction) -> tuple[bool, str | None]:
@@ -1777,8 +1788,11 @@ async def create_raid(
         if raid_name is None:
             raise ValueError("Raid name cannot be blank.")
         scheduled_at = parse_raid_datetime(date, time, DEFAULT_TIMEZONE_NAME)
-        if scheduled_at <= int(datetime.now(timezone.utc).timestamp()):
+        now = int(datetime.now(timezone.utc).timestamp())
+        if scheduled_at <= now:
             raise ValueError("Choose a future raid date and time in Pacific Time (PT). Dates without a year use the current year; include the year for a later year.")
+        if scheduled_at > now + MAX_SCHEDULE_AHEAD_SECONDS:
+            raise ValueError(DISTANT_SCHEDULE_ERROR)
     except ValueError as exc:
         await interaction.followup.send(str(exc), ephemeral=True)
         return
@@ -3260,8 +3274,11 @@ async def editraid(
                 changes["group_name"] = clean_short_text(None if group.strip() == "-" else group, "Group name", 50)
             if date is not None:
                 scheduled_at = parse_raid_datetime(date, time, DEFAULT_TIMEZONE_NAME)
-                if scheduled_at <= int(datetime.now(timezone.utc).timestamp()):
+                now = int(datetime.now(timezone.utc).timestamp())
+                if scheduled_at <= now:
                     raise ValueError("Choose a future raid date and time in Pacific Time.")
+                if scheduled_at > now + MAX_SCHEDULE_AHEAD_SECONDS:
+                    raise ValueError(DISTANT_SCHEDULE_ERROR)
                 changes.update(date=date.strip(), time=time.strip(), scheduled_at=scheduled_at)
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
@@ -3577,7 +3594,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         else:
             await interaction.response.send_message(message, ephemeral=True)
     except Exception as report_error:
-        logger.warning("Could not report an application command error: %s", type(report_error).__name__)
+        logger.warning("Could not report an application command error: %r", report_error)
 
 
 @bot.event

@@ -1,4 +1,5 @@
 import json
+import logging
 import unittest
 from datetime import date, datetime, timezone
 from unittest.mock import patch
@@ -7,6 +8,11 @@ import bot
 
 
 class HelperTests(unittest.TestCase):
+    def test_unknown_log_level_falls_back_to_info(self):
+        self.assertEqual(bot.resolve_log_level("debug"), logging.DEBUG)
+        self.assertEqual(bot.resolve_log_level("VERBOSE"), logging.INFO)
+        self.assertEqual(bot.resolve_log_level(None), logging.INFO)
+
     def test_decoders_tolerate_malformed_saved_values(self):
         for raw in (None, "", "{", "[]", "null", 42):
             with self.subTest(raw=raw):

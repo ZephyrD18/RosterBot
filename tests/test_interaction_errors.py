@@ -86,6 +86,21 @@ class InteractionErrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(logs.records[1].exc_info)
         view.stop()
 
+    async def test_report_failure_warning_includes_the_reporting_error(self):
+        command_event = self.event(responded=True)
+        command_event.followup.send.side_effect = RuntimeError("Report failed")
+        component_event = self.event(responded=True)
+        component_event.followup.send.side_effect = RuntimeError("Report failed")
+        view = bot.ErrorHandledView()
+        item = bot.discord.ui.Button(label="Standby", custom_id="raid_signup:123:standby")
+        with self.assertLogs("rosterbot", level="WARNING") as logs:
+            await bot.on_app_command_error(command_event, ValueError("Original failure"))
+            await view.on_error(component_event, ValueError("Original failure"), item)
+        warnings = [record.getMessage() for record in logs.records if record.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(all("Report failed" in warning for warning in warnings))
+        view.stop()
+
     async def test_permission_error_still_has_an_actionable_response(self):
         event = self.event()
         error = bot.discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing permissions")

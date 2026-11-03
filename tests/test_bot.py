@@ -1,13 +1,17 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 
 import bot
+
+
+FUTURE_DATE = (datetime.now(timezone.utc) + timedelta(days=60)).strftime("%m/%d/%Y")
+DISTANT_DATE = (datetime.now(timezone.utc) + timedelta(days=400)).strftime("%m/%d/%Y")
 
 
 class FakeMessage:
@@ -230,7 +234,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await bot.create_raid(
             interaction,
             "Recollection EX",
-            "12/31/2099",
+            FUTURE_DATE,
             "10PM",
             setup_message="Pick a role and get ready!",
             send_announcement=True,
@@ -254,7 +258,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             await bot.create_raid(
                 interaction,
                 "Recollection EX",
-                "12/31/2099",
+                FUTURE_DATE,
                 "10PM",
                 setup_message="Pick a role and get ready!",
                 send_announcement=True,

@@ -375,6 +375,24 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         for view in client.persistent_views:
             view.stop()
 
+    async def test_failed_command_sync_does_not_stop_startup(self):
+        client = bot.RosterClient(intents=bot.discord.Intents.none())
+        error = bot.discord.HTTPException(SimpleNamespace(status=503, reason="Unavailable"), "Try later")
+        with (
+            patch.object(bot, "init_db", new=AsyncMock()),
+            patch.object(bot, "fetch_all_raids", new=AsyncMock(return_value=[])),
+            patch.object(bot.tree, "sync", new=AsyncMock(side_effect=error)),
+            patch.object(bot, "reminder_loop", new=AsyncMock()),
+            patch.object(bot, "role_recovery_loop", new=AsyncMock()),
+            patch.object(bot.discord.Client, "close", new=AsyncMock()),
+            self.assertLogs("rosterbot", level="ERROR") as logs,
+        ):
+            await client.setup_hook()
+            started = (client.reminder_task, client.role_recovery_task)
+            await client.close()
+        self.assertTrue(all(task is not None for task in started))
+        self.assertIn("slash commands", logs.output[0])
+
     async def test_ready_event_does_not_repeat_setup(self):
         with (
             patch.object(bot, "init_db", new=AsyncMock()) as initialize,
