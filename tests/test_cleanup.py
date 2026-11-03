@@ -109,6 +109,67 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(saved["finished_at"])
         self.assertEqual(saved["signups"]["MT"]["user_id"], 42)
 
+    async def test_inaccessible_expired_raid_waits_for_its_backoff(self):
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        fetch = AsyncMock(side_effect=bot.discord.Forbidden(response, "Cannot access"))
+        expired = self.raid["scheduled_at"] + 7200
+        with (
+            patch.object(bot.bot, "get_channel", return_value=None),
+            patch.object(bot.bot, "fetch_channel", new=fetch),
+            patch.object(bot, "datetime") as clock,
+            self.assertLogs("rosterbot", level="WARNING"),
+        ):
+            for at in (expired, expired + 59, expired + 60):
+                clock.now.return_value = datetime.fromtimestamp(at, timezone.utc)
+                await bot.send_due_reminders()
+        self.assertEqual(fetch.await_count, 2)
+        saved = await bot.fetch_signup(123)
+        self.assertEqual(
+            (saved["cleanup_attempts"], saved["cleanup_retry_at"], saved["cleanup_failing_since"]),
+            (2, expired + 180, expired),
+        )
+
+    async def test_failed_pending_cleanup_waits_but_deletion_command_retries_now(self):
+        await bot.mark_raid_cleanup_pending(self.raid)
+        with (
+            patch.object(bot, "fetch_raid_channel", new=AsyncMock(return_value=None)),
+            patch.object(bot.bot, "get_guild", return_value=self.event.guild),
+            patch.object(bot, "remove_all_raid_roles", new=AsyncMock(return_value=["Discord unavailable"])) as remove,
+            patch.object(bot, "datetime") as clock,
+            self.assertLogs("rosterbot", level="WARNING"),
+        ):
+            for at in (1_000_000, 1_000_030):
+                clock.now.return_value = datetime.fromtimestamp(at, timezone.utc)
+                await bot.send_due_reminders()
+        remove.assert_awaited_once()
+        self.assertEqual((await bot.fetch_signup(123))["cleanup_retry_at"], 1_000_060)
+        with patch.object(bot, "remove_all_raid_roles", new=AsyncMock(return_value=[])):
+            deleted, _ = await bot.delete_raid_for_command(self.event, self.raid)
+        self.assertTrue(deleted)
+        self.assertIsNone(await bot.fetch_signup(123))
+
+    async def test_departed_server_raid_skips_discord_and_retires_after_a_week(self):
+        week = 7 * 24 * 60 * 60
+        expired = self.raid["scheduled_at"] + 7200
+        fetch = AsyncMock()
+        with (
+            patch.object(bot.bot, "is_ready", return_value=True),
+            patch.object(bot.bot, "get_guild", return_value=None),
+            patch.object(bot.bot, "get_channel", return_value=None),
+            patch.object(bot.bot, "fetch_channel", new=fetch),
+            patch.object(bot, "datetime") as clock,
+            self.assertLogs("rosterbot", level="INFO") as logs,
+        ):
+            for at in (expired, expired + week - 1000):
+                clock.now.return_value = datetime.fromtimestamp(at, timezone.utc)
+                await bot.send_due_reminders()
+            self.assertIsNotNone(await bot.fetch_signup(123))
+            clock.now.return_value = datetime.fromtimestamp(expired + week + 1000, timezone.utc)
+            await bot.send_due_reminders()
+        fetch.assert_not_awaited()
+        self.assertIsNone(await bot.fetch_signup(123))
+        self.assertTrue(any("server 1" in line for line in logs.output))
+
     async def test_legacy_server_backfill_preserves_saved_server_ids(self):
         legacy = self.raid | {"signup_message_id": 124, "guild_id": None}
         await bot.insert_raid(legacy)

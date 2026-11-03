@@ -864,7 +864,8 @@ RAID_COLUMNS = """
     reminders_sent, reminder_offset, raid_role_id, raid_role_name,
     announcement_message_id, setup_message, notify_role_id, notify_role_name,
     meeting_server, cleanup_pending, guild_id, finished_at,
-    ready_check_started_at, start_reminder_message_ids
+    ready_check_started_at, start_reminder_message_ids,
+    cleanup_attempts, cleanup_retry_at, cleanup_failing_since
 """
 
 
@@ -901,7 +902,10 @@ async def init_db():
                 guild_id INTEGER,
                 finished_at INTEGER,
                 ready_check_started_at INTEGER,
-                start_reminder_message_ids TEXT NOT NULL DEFAULT '[]'
+                start_reminder_message_ids TEXT NOT NULL DEFAULT '[]',
+                cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+                cleanup_retry_at INTEGER,
+                cleanup_failing_since INTEGER
             )
             """
         )
@@ -936,6 +940,9 @@ async def init_db():
             ("finished_at", "INTEGER"),
             ("ready_check_started_at", "INTEGER"),
             ("start_reminder_message_ids", "TEXT NOT NULL DEFAULT '[]'"),
+            ("cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("cleanup_retry_at", "INTEGER"),
+            ("cleanup_failing_since", "INTEGER"),
         )
         for column_name, column_type in migrations:
             if column_name not in columns:
@@ -1188,6 +1195,28 @@ async def finish_raid_cleanup(guild, raid: dict) -> tuple[bool, list[str]]:
         return False, [*warnings, "The posts were deleted. Role cleanup is saved and will retry automatically."]
     await delete_raid_row(raid["signup_message_id"])
     return True, []
+
+
+async def defer_raid_cleanup(raid: dict, now: int) -> None:
+    failing_since = raid.get("cleanup_failing_since") or now
+    if bot_left_guild(raid.get("guild_id")) and now - failing_since >= DEPARTED_SERVER_RETENTION_SECONDS:
+        await delete_raid_row(raid["signup_message_id"])
+        logger.info("Removed raid %s after a week without access to server %s", raid["signup_message_id"], raid["guild_id"])
+        return
+    attempts = raid.get("cleanup_attempts", 0) + 1
+    retry_at = now + retry_delay(attempts)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE signups SET cleanup_attempts = ?, cleanup_retry_at = ?, cleanup_failing_since = ?
+            WHERE signup_message_id = ?
+            """,
+            (attempts, retry_at, failing_since, raid["signup_message_id"]),
+        )
+        await db.commit()
+    raid.update(cleanup_attempts=attempts, cleanup_retry_at=retry_at, cleanup_failing_since=failing_since)
+    logger.info("Cleanup attempt %s for raid %s failed; retrying in %s minutes", attempts, raid["signup_message_id"],
+                retry_delay(attempts) // 60)
 
 
 async def backfill_raid_guilds():
@@ -1583,6 +1612,8 @@ async def fetch_raid_channel(raid: dict, *, raise_not_found: bool = False):
         return None
     channel = bot.get_channel(raid["channel_id"])
     if channel is None:
+        if bot_left_guild(raid.get("guild_id")):
+            return None
         try:
             channel = await bot.fetch_channel(raid["channel_id"])
         except discord.NotFound:
@@ -3301,13 +3332,11 @@ async def readycheck(interaction: discord.Interaction, signup_message_id: str | 
 # --- Reminders and cleanup ---
 
 def reminder_work_due(raid: dict, now: int) -> bool:
-    if raid.get("cleanup_pending"):
-        return True
     scheduled_at = raid.get("scheduled_at")
+    if raid.get("cleanup_pending") or (scheduled_at is not None and now >= scheduled_at + RAID_CLEANUP_SECONDS):
+        return now >= (raid.get("cleanup_retry_at") or 0)
     if scheduled_at is None:
         return False
-    if now >= scheduled_at + RAID_CLEANUP_SECONDS:
-        return True
     if now >= scheduled_at:
         return bool(raid.get("start_reminder_message_ids"))
     if raid.get("finished_at") is not None:
@@ -3353,6 +3382,8 @@ async def process_due_raid(signup_message_id: int):
                 logger.warning("Post-raid cleanup for %s: %s", signup_message_id, warning)
             if deleted:
                 logger.info("Completed post-raid cleanup for %s", signup_message_id)
+            else:
+                await defer_raid_cleanup(raid, now)
             return
 
         scheduled_at = raid.get("scheduled_at")
@@ -3366,6 +3397,7 @@ async def process_due_raid(signup_message_id: int):
             else:
                 if channel is None or not await delete_raid_messages(channel, raid):
                     logger.warning("Could not delete all posts for expired raid %s; cleanup will retry", signup_message_id)
+                    await defer_raid_cleanup(raid, now)
                     return
             await mark_raid_cleanup_pending(raid)
             guild = getattr(channel, "guild", None)
@@ -3376,6 +3408,8 @@ async def process_due_raid(signup_message_id: int):
                 logger.warning("Post-raid cleanup for %s: %s", signup_message_id, warning)
             if deleted:
                 logger.info("Deleted expired raid %s", signup_message_id)
+            else:
+                await defer_raid_cleanup(raid, now)
             return
 
         if now >= scheduled_at:
