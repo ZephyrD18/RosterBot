@@ -37,6 +37,7 @@ Old separate signup/roster posts consolidate on their next successful refresh.
 
 Management commands require Manage Messages. Changing the signup role additionally requires Manage Roles and role hierarchy checks.
 Failed role assignments/removals stay saved for automatic retry, including after resignation, clearing, role changes, or restart.
+Locking a roster freezes role, job, and standby changes and leaving; Mount Status and ready-check answers still work.
 Retries check current active memberships so leaving an old raid cannot remove a role needed by a new one.
 
 ## Local Run
@@ -61,6 +62,7 @@ the file is not loaded automatically. The bot requires `DISCORD_TOKEN`, while th
 Raid dates and entered times use Pacific Time (PT); posted Discord timestamps display in each viewer's timezone.
 Use `today`, a month/day such as `10/24`, or an explicit year such as `2027-01-01`.
 Omitting the year means the current Pacific year. Past dates and times return an error instead of moving to another year.
+Raids must start within the next year, so a mistyped year cannot create a roster that never expires.
 
 Standby offers four choices: **Tank**, **Healer**, **Melee DPS**, and **Range DPS**. Select any combination and press
 **Confirm Standby**. Clear the selections and confirm to leave standby. Standby does not require choosing one job or answering
@@ -73,7 +75,9 @@ The final reminder uses static wording and deletes at the raid start. Its messag
 Discord failures. Rescheduling removes an old final reminder before changing the time. Earlier automatic reminders remain visible.
 The **Mount Status** button reopens the mount question, including on locked rosters.
 Existing signup posts receive updated buttons when the roster is next refreshed.
-Failed role updates retry each minute while the bot can access the server.
+Failed role updates and post-raid cleanup retry automatically, waiting 1, 2, 4… minutes between attempts (at most six hours).
+`/repairraid` and the deletion commands retry immediately. If the bot is removed from a server, it stops contacting that
+server and deletes that server's saved rosters and role updates after a week without access.
 Pending cleanup is excluded from active rosters; retry immediately using either deletion command with its signup message ID.
 New rosters save their server ID so pending role cleanup can continue after the channel disappears.
 Existing rosters acquire that ID when their channel is cached at startup or subsequently resolved.
@@ -104,7 +108,9 @@ Run one bot instance against the database; its interaction and role locks coordi
 ## Dependencies
 
 Dependencies stay in the Python environment and are not bundled with the bot source.
-`requirements.txt` also pins two HTTP dependencies to patched versions.
+`requirements.txt` pins every package, including sub-dependencies, to an exact version with SHA-256 hashes, so each
+host restart installs exactly the tested set (Python 3.12–3.14, Windows and Linux). To change dependencies, edit
+`requirements.in` and regenerate `requirements.txt` with the `uv pip compile` command at the top of that file.
 On Python 3.13 and later, discord.py requires the separately installed `audioop-lts` compatibility library.
 
 | Package | Source | License |

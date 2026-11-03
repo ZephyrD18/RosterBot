@@ -1,0 +1,7 @@
+# Direct dependencies. requirements.txt is generated from this file with pinned versions and hashes:
+#   uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes --no-annotate -o requirements.txt
+discord.py==2.7.1
+aiosqlite==0.22.1
+aiohttp==3.14.5
+multidict==7.2.1
+audioop-lts==0.2.2; python_version >= "3.13"

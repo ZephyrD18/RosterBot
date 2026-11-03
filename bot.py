@@ -3115,7 +3115,8 @@ async def help_command(interaction: discord.Interaction):
             "Early reminders ping signed players. The five-minute reminder also pings matching standby players "
             "when there are open slots; a full roster does not ping standby. This message deletes when the raid starts. "
             "The roster and tracked posts auto-delete two hours after start. "
-            "Failed role updates are saved and retried each minute. The bot must be running."
+            "Failed role updates are saved and retried automatically, waiting longer after repeated failures. "
+            "`/repairraid` retries immediately. The bot must be running."
         ),
         inline=False,
     )

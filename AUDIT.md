@@ -1,3 +1,37 @@
+# Deep audit and fixes — November 2, 2026
+
+Reviewed all of `bot.py` (including the then-uncommitted standby-picker expiry work), every test, dependency metadata, and
+git history. No exploitable vulnerability was found. Neither an ordinary member nor a manager from another server can
+escalate privileges, ping people who did not opt in, or reach another channel's roster. Commands re-check Manage Messages
+when they run, pasted signup IDs from other channels are rejected, and every pinging message lists exact users or one
+notification role. The role-safety check blocks every moderation and management permission. SQL values are always bound.
+Git history contains no tokens, `.env`, or database files, and OSV listed no advisories for the 13 installed packages.
+
+| Finding | Change |
+| --- | --- |
+| Only direct dependencies were pinned; sub-dependencies could drift on every host restart, unverified. | `requirements.txt` is now generated from `requirements.in` with exact versions and SHA-256 hashes for every package (Python 3.12–3.14). |
+| Failed cleanup and role retries repeated every minute with no backoff. Servers that removed the bot were retried forever with 403s, keeping member IDs. | Retries back off 1, 2, 4… minutes up to six hours; manual commands retry immediately and a new failure restarts the wait. While the connected bot is out of a server, it skips Discord calls for it and deletes that server's rows after a week. |
+| The single reminder worker visited past-due cleanup before upcoming reminders, so a stall could push a reminder past its start; such misses were not logged. | Upcoming reminders run first, and a reminder that still misses its start is logged. |
+| Job changes still worked on locked rosters, contradicting `/help`. | Locking disables the Job button and rejects open job pickers. Mount Status and ready-check answers stay available. |
+| A failed slash-command sync stopped startup. | The failure is logged and startup continues with the previously registered commands. |
+| Error-report failures logged only the exception type. | The warning includes the reporting exception, still without a second traceback. |
+| An unknown `LOG_LEVEL` crashed at import; a mistyped year (e.g. 9999) created a roster that never expired. | Unknown levels fall back to INFO with a warning; start times more than a year ahead are rejected. |
+| `.freebuff/project-id` tool metadata was committed. | Untracked and ignored; the local file is kept. |
+
+Raid creation still attaches the default `FFXIVActiveRoster` role with only Manage Messages. The server confirmed that role
+grants no access; it exists only to ping raid participants.
+
+Verification: **224 tests pass** on Python 3.14.9 and 3.12.10 in fresh environments installed from the hashed lock with
+`--require-hashes`, and `pip check` passes. Linux `manylinux_2_28_x86_64` wheels for Python 3.12 and 3.14 downloaded and
+matched every hash. Offline reproductions confirmed the retry and scheduler findings before the fixes. No live Discord
+server, token, or hosted deployment was used.
+
+Remaining: updates to dependencies are now deliberate (edit `requirements.in` and regenerate). A server that removes the bot
+while it is offline is detected only after the bot reconnects. discord.py 2.7.1 calls an asyncio function that Python 3.16
+plans to remove; Python 3.14 is unaffected.
+
+---
+
 # Standby and cleanup revision — October 26, 2026
 
 Updated the bot to the user's revised signup and cleanup flow:
