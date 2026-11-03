@@ -1831,6 +1831,9 @@ class JobChoiceView(ErrorHandledView):
             if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
                 await interaction.followup.send("This raid is no longer accepting job changes.", ephemeral=True)
                 return
+            if raid["locked"]:
+                await interaction.followup.send("This roster is locked.", ephemeral=True)
+                return
             if self.is_finished():
                 await interaction.followup.send("This job picker is closed. Use the Job button to reopen it.", ephemeral=True)
                 return
@@ -2136,7 +2139,7 @@ class RaidSignupView(ErrorHandledView):
         self.add_standby_button(raid)
         self.add_resign_button(raid)
         self.add_mount_button()
-        self.add_job_button()
+        self.add_job_button(raid)
         self.add_ready_button(raid)
         if raid.get("finished_at") is not None or raid.get("cleanup_pending"):
             for item in self.children:
@@ -2189,10 +2192,11 @@ class RaidSignupView(ErrorHandledView):
         button.callback = self.mount_callback
         self.add_item(button)
 
-    def add_job_button(self):
+    def add_job_button(self, raid: dict):
         button = discord.ui.Button(
             label="Job", style=discord.ButtonStyle.secondary,
             custom_id=f"raid_signup:{self.signup_message_id}:job", row=4,
+            disabled=raid["locked"],
         )
         button.callback = self.job_callback
         self.add_item(button)
@@ -2202,6 +2206,9 @@ class RaidSignupView(ErrorHandledView):
         raid = await fetch_signup(self.signup_message_id)
         if not raid or raid.get("cleanup_pending") or raid.get("finished_at") is not None:
             await interaction.followup.send("This raid is completed or unavailable.", ephemeral=True)
+            return
+        if raid["locked"]:
+            await interaction.followup.send("This roster is locked.", ephemeral=True)
             return
         role_key = next((key for key, player in raid["signups"].items()
                          if player.get("user_id") == interaction.user.id), None)
@@ -2943,8 +2950,8 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="/lockroster and /unlockroster",
         value=(
-            "Locks or unlocks a roster. Locked rosters stop role changes and resigns. "
-            "Requires Manage Messages."
+            "Locks or unlocks a roster. Locked rosters stop role changes, job changes, standby changes, and resigns. "
+            "Mount Status and ready-check answers still work. Requires Manage Messages."
         ),
         inline=False,
     )

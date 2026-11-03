@@ -112,14 +112,30 @@ class JobChoiceTests(unittest.IsolatedAsyncioTestCase):
         picker.stop()
         view.stop()
 
-    async def test_locked_roster_still_allows_current_player_to_finish_job_details(self):
+    async def test_locked_roster_rejects_an_open_job_picker(self):
+        view = bot.JobChoiceView(123, 42, "MT")
         self.raid["locked"] = True
         await bot.save_raid_state(self.raid)
-        view = bot.JobChoiceView(123, 42, "MT")
-        with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)):
+        with patch.object(bot, "update_raid_messages", new=AsyncMock(return_value=True)) as refresh:
             await view.set_job(self.event, "Warrior")
-        self.assertEqual((await bot.fetch_signup(123))["signups"]["MT"]["job"], "Warrior")
-        self.event.edit_original_response.await_args.kwargs["view"].stop()
+        self.assertIsNone((await bot.fetch_signup(123))["signups"]["MT"]["job"])
+        self.assertIn("locked", self.event.followup.send.await_args.args[0])
+        self.event.edit_original_response.assert_not_awaited()
+        refresh.assert_not_awaited()
+        view.stop()
+
+    async def test_locked_roster_disables_and_rejects_the_job_button(self):
+        self.raid["locked"] = True
+        await bot.save_raid_state(self.raid)
+        view = bot.RaidSignupView(self.raid)
+        job_button = next(item for item in view.children if item.custom_id == "raid_signup:123:job")
+        mount_button = next(item for item in view.children if item.custom_id == "raid_signup:123:mount")
+        self.assertTrue(job_button.disabled)
+        self.assertFalse(mount_button.disabled)
+        await view.job_callback(self.event)
+        self.assertIn("locked", self.event.followup.send.await_args.args[0])
+        self.assertNotIn("view", self.event.followup.send.await_args.kwargs)
+        view.stop()
 
     async def test_standby_player_selects_a_main_role_before_choosing_a_job(self):
         self.raid["signups"] = {}
